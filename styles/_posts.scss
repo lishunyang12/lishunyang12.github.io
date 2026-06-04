@@ -1,0 +1,77 @@
+div.Posts {
+  width: 100%;
+  margin-bottom: 96px;
+
+  div.postcard {
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 0 48px rgba(0, 0, 0, 0.05);
+    padding: 32px;
+    width: 100%;
+    margin-bottom: 32px;
+
+    div {
+      margin-bottom: 16px;
+
+      h3 {
+        font-size: 1.5em;
+        margin: 0 0 16px 0;
+        font-family: "Prata";
+        color: $accent;
+      }
+
+      span:not(.bull) {
+        font-family: "Fira Mono";
+
+        &:not(:first-of-type) {
+          margin-left: 16px;
+        }
+
+        &:not(:last-of-type) {
+          margin-right: 16px;
+        }
+      }
+    }
+
+    p {
+      margin: 0;
+    }
+
+    transition: 200ms transform,
+    200ms box-shadow;
+    cursor: pointer;
+
+    &:hover {
+      transform: translateY(-6px) scale(1.01);
+      box-shadow: 0 0 32px rgba(0, 0, 0, 0.04);
+    }
+  }
+
+  div.end {
+    text-align: center;
+    font-size: 1.2em;
+    margin-top: 48px;
+  }
+}
+
+@media only screen and (max-width: 600px) {
+  div.Posts {
+    div.postcard {
+      div {
+        span {
+          display: block;
+          margin-left: 0 !important;
+          margin-right: 0 !important;
+
+          &.bull {
+            display: none;
+          }
+
+          &:last-of-type {
+            margin-top: 4px;
+          }
+        }
+      }
+    }
+  }
+}

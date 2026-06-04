@@ -1,0 +1,8 @@
+[site]
+name = "Sylar"
+author = "lishunyang <lishunyang03@gmail.com>"
+
+[settings]
+strip_extensions = true
+save_data_files = false
+save_metadata = true

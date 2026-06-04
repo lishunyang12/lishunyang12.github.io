@@ -1,0 +1,7 @@
+dist/
+temp/
+node_modules/
+metadata.json
+static/style.css
+*.exe
+/stuart

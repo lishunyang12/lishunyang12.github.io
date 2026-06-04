@@ -1,0 +1,110 @@
+// Extra styling for technical posts: tables, charts (inline SVG), figures, callouts.
+.post {
+  figure {
+    margin: 1.8em 0;
+  }
+
+  .chartbox {
+    background: #f6faef;
+    border: 1px solid #e3eed0;
+    border-left: 4px solid $accent;
+    border-radius: 4px;
+    padding: 14px 10px;
+  }
+
+  .chart {
+    width: 100%;
+    height: auto;
+
+    .grid { stroke: #dfe9cf; stroke-width: 1; }
+    .tick, .axlab { fill: #6b7280; font-size: 12px; font-family: "Fira Mono"; }
+    .pt { font-size: 12px; font-weight: 700; }
+    .leg { fill: #222222; font-size: 13px; }
+  }
+
+  figcaption, .cap {
+    font-size: 0.78em;
+    color: #6b7280;
+    text-align: center;
+    font-style: italic;
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8em;
+    line-height: 1.45;
+    margin: 1.4em 0 0.3em 0;
+    border-top: 2px solid $accent;
+    border-bottom: 2px solid $accent;
+  }
+
+  th {
+    background: #eef6e0;
+    text-align: right;
+    padding: 7px 10px;
+    font-weight: 700;
+    border-bottom: 1px solid $accent;
+    font-family: "Inter";
+  }
+
+  th:first-child { text-align: left; }
+
+  td {
+    padding: 6px 10px;
+    text-align: right;
+    border-top: 1px solid #ececec;
+    font-family: "Fira Mono";
+  }
+
+  td:first-child { text-align: left; font-family: "Inter"; }
+
+  tr:nth-child(even) td { background: #fafdf5; }
+
+  .table-caption {
+    font-size: 0.78em;
+    color: #6b7280;
+    text-align: center;
+    font-style: italic;
+    margin-bottom: 6px;
+  }
+
+  .gal {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 0;
+
+    img {
+      width: 100%;
+      margin: 0;
+      border-radius: 4px;
+      box-shadow: none;
+      border: 1px solid #e3e3e3;
+    }
+
+    .c {
+      text-align: center;
+      font-size: 0.68em;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+  }
+
+  .callout {
+    background: #f6faef;
+    border-left: 4px solid $accent;
+    padding: 10px 16px;
+    border-radius: 0 4px 4px 0;
+    margin: 1.4em 0;
+    font-size: 0.95em;
+  }
+
+  ok-pos, .pos { color: $accent-dark; }
+}
+
+@media only screen and (max-width: 600px) {
+  .post .gal { grid-template-columns: repeat(2, 1fr); }
+}
