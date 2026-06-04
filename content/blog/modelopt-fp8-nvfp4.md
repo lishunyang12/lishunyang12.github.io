@@ -1,7 +1,7 @@
 ---
 slug: "/blog/modelopt-fp8-nvfp4"
 date: "2026-06-05"
-title: "vLLM-Omni 量化推理实践(1)"
+title: "vLLM-Omni 量化推理实践"
 description: "Qwen-Image-2512 的 FP8 / 混合 FP8/NVFP4：显存、保真度与并发吞吐。"
 ---
 
@@ -83,4 +83,4 @@ vllm serve Qwen/Qwen-Image-2512 --omni --tensor-parallel-size 2 --quantization f
 
 ## 结论
 
-对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 Qwen-Image-2512，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。单流延迟敏感场景下 BF16 仍更优；追求吞吐时优先量化，其中混合 FP8/NVFP4 在并发下最快、峰值显存也最低。本文是该系列的第一篇，后续将展开在线量化、内核细节与更多模型上的实践。
+对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 Qwen-Image-2512，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。单流延迟敏感场景下 BF16 仍更优；追求吞吐时优先量化，其中混合 FP8/NVFP4 在并发下最快、峰值显存也最低。后续我们会继续展开在线量化、内核细节与更多模型上的实践。
