@@ -1,7 +1,7 @@
 ---
 slug: "/blog/modelopt-fp8-nvfp4"
 date: "2026-06-05"
-title: "在 B300 上实测 vLLM-Omni 的 FP8 与 NVFP4 量化"
+title: "vLLM-Omni 量化推理实践(1)"
 description: "Qwen-Image-2512 的 FP8 / 混合 FP8/NVFP4：显存、保真度与并发吞吐。"
 ---
 
@@ -75,49 +75,12 @@ vllm serve Qwen/Qwen-Image-2512 --omni --tensor-parallel-size 2 --quantization f
 下图给出并发 1、4、8 个在途请求时的持续吞吐（images/s），采用批处理服务（`--step-execution --max-num-seqs 8`，每点 16 个请求）。可观察到明显的交叉：低并发下 BF16 最快，但随批次填满，量化格式的权重带宽节省压过其逐次开销。
 
 <figure>
-<div class="chartbox"><svg viewBox="0 0 720 350" xmlns="http://www.w3.org/2000/svg" class="chart"><line x1="54" y1="308.0" x2="570" y2="308.0" class="grid"/><text x="45" y="312.0" class="tick" text-anchor="end">0.0</text><line x1="54" y1="250.0" x2="570" y2="250.0" class="grid"/><text x="45" y="254.0" class="tick" text-anchor="end">0.3</text><line x1="54" y1="192.0" x2="570" y2="192.0" class="grid"/><text x="45" y="196.0" class="tick" text-anchor="end">0.6</text><line x1="54" y1="134.0" x2="570" y2="134.0" class="grid"/><text x="45" y="138.0" class="tick" text-anchor="end">0.9</text><line x1="54" y1="76.0" x2="570" y2="76.0" class="grid"/><text x="45" y="80.0" class="tick" text-anchor="end">1.2</text><line x1="54" y1="18.0" x2="570" y2="18.0" class="grid"/><text x="45" y="22.0" class="tick" text-anchor="end">1.5</text><text x="13" y="163.0" class="axlab" transform="rotate(-90 13 163.0)" text-anchor="middle">吞吐 (images/s)</text><text x="54.0" y="333.0" class="tick" text-anchor="middle">1</text><text x="312.0" y="333.0" class="tick" text-anchor="middle">4</text><text x="570.0" y="333.0" class="tick" text-anchor="middle">8</text><text x="312.0" y="345" class="axlab" text-anchor="middle">并发 (同时在途请求数)</text><polyline points="54.0,142.7 312.0,154.9 570.0,88.2" fill="none" stroke="#6C7A89" stroke-width="2.6"/><circle cx="54.0" cy="142.7" r="4" fill="#6C7A89"/><circle cx="312.0" cy="154.9" r="4" fill="#6C7A89"/><circle cx="570.0" cy="88.2" r="4" fill="#6C7A89"/><text x="578.0" y="92.2" class="pt" fill="#6C7A89">1.137</text><polyline points="54.0,142.9 312.0,140.8 570.0,69.6" fill="none" stroke="#76b900" stroke-width="2.6"/><circle cx="54.0" cy="142.9" r="4" fill="#76b900"/><circle cx="312.0" cy="140.8" r="4" fill="#76b900"/><circle cx="570.0" cy="69.6" r="4" fill="#76b900"/><text x="578.0" y="73.6" class="pt" fill="#76b900">1.233</text><polyline points="54.0,140.2 312.0,149.9 570.0,72.5" fill="none" stroke="#1B5A8E" stroke-width="2.6"/><circle cx="54.0" cy="140.2" r="4" fill="#1B5A8E"/><circle cx="312.0" cy="149.9" r="4" fill="#1B5A8E"/><circle cx="570.0" cy="72.5" r="4" fill="#1B5A8E"/><text x="578.0" y="76.5" class="pt" fill="#1B5A8E">1.218</text><polyline points="54.0,196.6 312.0,138.3 570.0,47.6" fill="none" stroke="#BD3613" stroke-width="2.6"/><circle cx="54.0" cy="196.6" r="4" fill="#BD3613"/><circle cx="312.0" cy="138.3" r="4" fill="#BD3613"/><circle cx="570.0" cy="47.6" r="4" fill="#BD3613"/><text x="578.0" y="51.6" class="pt" fill="#BD3613">1.347</text><rect x="596" y="20" width="12" height="12" rx="2" fill="#6C7A89"/><text x="613" y="30" class="leg">BF16</text><rect x="596" y="43" width="12" height="12" rx="2" fill="#76b900"/><text x="613" y="53" class="leg">在线 FP8</text><rect x="596" y="66" width="12" height="12" rx="2" fill="#1B5A8E"/><text x="613" y="76" class="leg">离线 ModelOpt FP8</text><rect x="596" y="89" width="12" height="12" rx="2" fill="#BD3613"/><text x="613" y="99" class="leg">混合 FP8/NVFP4</text></svg></div>
+<div class="chartbox"><svg viewBox="0 0 720 350" xmlns="http://www.w3.org/2000/svg" class="chart"><line x1="54" y1="308.0" x2="686" y2="308.0" class="grid"/><text x="45" y="312.0" class="tick" text-anchor="end">0.0</text><line x1="54" y1="250.0" x2="686" y2="250.0" class="grid"/><text x="45" y="254.0" class="tick" text-anchor="end">0.3</text><line x1="54" y1="192.0" x2="686" y2="192.0" class="grid"/><text x="45" y="196.0" class="tick" text-anchor="end">0.6</text><line x1="54" y1="134.0" x2="686" y2="134.0" class="grid"/><text x="45" y="138.0" class="tick" text-anchor="end">0.9</text><line x1="54" y1="76.0" x2="686" y2="76.0" class="grid"/><text x="45" y="80.0" class="tick" text-anchor="end">1.2</text><line x1="54" y1="18.0" x2="686" y2="18.0" class="grid"/><text x="45" y="22.0" class="tick" text-anchor="end">1.5</text><text x="13" y="163.0" class="axlab" transform="rotate(-90 13 163.0)" text-anchor="middle">吞吐 (images/s)</text><text x="54.0" y="333.0" class="tick" text-anchor="middle">1</text><text x="370.0" y="333.0" class="tick" text-anchor="middle">4</text><text x="686.0" y="333.0" class="tick" text-anchor="middle">8</text><text x="370.0" y="345" class="axlab" text-anchor="middle">并发 (同时在途请求数)</text><polyline points="54.0,142.7 370.0,154.9 686.0,88.2" fill="none" stroke="#6C7A89" stroke-width="2.6"/><circle cx="54.0" cy="142.7" r="4" fill="#6C7A89"/><circle cx="370.0" cy="154.9" r="4" fill="#6C7A89"/><circle cx="686.0" cy="88.2" r="4" fill="#6C7A89"/><text x="694.0" y="92.2" class="pt" fill="#6C7A89">1.137</text><polyline points="54.0,142.9 370.0,140.8 686.0,69.6" fill="none" stroke="#76b900" stroke-width="2.6"/><circle cx="54.0" cy="142.9" r="4" fill="#76b900"/><circle cx="370.0" cy="140.8" r="4" fill="#76b900"/><circle cx="686.0" cy="69.6" r="4" fill="#76b900"/><text x="694.0" y="73.6" class="pt" fill="#76b900">1.233</text><polyline points="54.0,140.2 370.0,149.9 686.0,72.5" fill="none" stroke="#1B5A8E" stroke-width="2.6"/><circle cx="54.0" cy="140.2" r="4" fill="#1B5A8E"/><circle cx="370.0" cy="149.9" r="4" fill="#1B5A8E"/><circle cx="686.0" cy="72.5" r="4" fill="#1B5A8E"/><text x="694.0" y="76.5" class="pt" fill="#1B5A8E">1.218</text><polyline points="54.0,196.6 370.0,138.3 686.0,47.6" fill="none" stroke="#BD3613" stroke-width="2.6"/><circle cx="54.0" cy="196.6" r="4" fill="#BD3613"/><circle cx="370.0" cy="138.3" r="4" fill="#BD3613"/><circle cx="686.0" cy="47.6" r="4" fill="#BD3613"/><text x="694.0" y="51.6" class="pt" fill="#BD3613">1.347</text><rect x="528" y="208" width="160" height="96" rx="3" fill="#ffffff" opacity="0.72"/><rect x="536" y="212" width="12" height="12" rx="2" fill="#6C7A89"/><text x="554" y="222" class="leg">BF16</text><rect x="536" y="234" width="12" height="12" rx="2" fill="#76b900"/><text x="554" y="244" class="leg">在线 FP8</text><rect x="536" y="256" width="12" height="12" rx="2" fill="#1B5A8E"/><text x="554" y="266" class="leg">离线 ModelOpt FP8</text><rect x="536" y="278" width="12" height="12" rx="2" fill="#BD3613"/><text x="554" y="288" class="leg">混合 FP8/NVFP4</text></svg></div>
 <figcaption>图 4. 吞吐随并发变化，越高越好，标注并发 8 处的端点值。并发 8 时三种量化配置均超过 BF16（1.137）：混合 1.347（+18%）、在线 FP8 1.233（+8%）、离线 FP8 1.218（+7%）。混合配置从并发 1 到 8 扩展 2.34×。</figcaption>
 </figure>
 
 该交叉是核心的运行结论：对延迟敏感的单流服务，本硬件上 BF16 仍更优；对吞吐导向的批处理服务，量化配置全面占优。这一“随机制依赖”与上游 Qwen3-Omni W4A4 工作（PR #4025）一致——量化优势同样在并发下、而非单流延迟中显现。
 
-## FP8 路径的批处理缺陷及其修复
-
-离线 ModelOpt FP8 路径在 `--max-num-seqs 1` 下服务正常，但一旦在 step execution 下批处理两条序列即确定性失败。编译后、序列打包的激活非连续，而内核试图用 `Tensor.view` 重解释它——这在 `torch.compile` 的 fake-tensor 追踪下对非连续存储非法：
-
-```text
-torch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake tensor call
-  File ".../layers/quantization/modelopt.py", line 611, in apply
-  File ".../kernels/linear/scaled_mm/ScaledMMLinearKernel.py", line 134, in apply_weights
-    x_2d = x.view(-1, x.shape[-1])
-```
-
-修复极小：将 `Tensor.view` 改为 `Tensor.reshape`——后者在布局允许时返回视图，仅在不可能时才拷贝：
-
-```diff
--    x_2d = x.view(-1, x.shape[-1])
-+    x_2d = x.reshape(-1, x.shape[-1])
-```
-
-修复后，离线 FP8 路径在所有测试并发下均无错批处理，并贡献了图 4 的吞吐。混合配置从未受影响，因其走 CUTLASS NVFP4 路径而非 scaled-matrix-multiply 内核。在线 FP8 因共用同一路径，该修复同样适用。其长期归宿应是上游 `vllm-project/vllm`（已作为 PR #4155 提交）。
-
-## Blackwell Ultra 上的在线量化支持
-
-对四种在线方法分别以对应标志服务 BF16 checkpoint，结果见下表：本硬件上仅 FP8 可用，其余三者因不同的内核级原因在加载时失败。
-
-<div class="table-caption">表 2. 2× B300（SM103）上的在线量化支持矩阵。</div>
-<table>
-<thead><tr><th>方法</th><th>标志</th><th>结果</th><th>原因</th></tr></thead>
-<tbody>
-<tr><td>FP8</td><td><code>--quantization fp8</code></td><td>可用</td><td>—</td></tr>
-<tr><td>INT8 (W8A8)</td><td><code>--quantization int8</code></td><td>加载失败</td><td>CUTLASS scaled-mm 拒绝 SM103：“Int8 not supported on SM103.”</td></tr>
-<tr><td>MXFP8 (W8A8)</td><td><code>--quantization mxfp8</code></td><td>加载失败</td><td>NotImplementedError：仅 Ascend (NPU) / Intel (XPU)。</td></tr>
-<tr><td>MXFP4 (W4A4)</td><td><code>--quantization mxfp4</code></td><td>加载失败</td><td>NotImplementedError：仅 Ascend；CUDA 尚未实现。</td></tr>
-</tbody>
-</table>
-
-值得注意的是，尽管文档将 Int8 列为“Blackwell SM100+”支持，INT8 W8A8 内核却拒绝 SM103，表明存在 Blackwell Ultra 特有的“文档—内核”落差。在本模型与硬件上，在线 FP8 在各维度均持平或略胜离线 ModelOpt FP8——更低延迟（1.157 s 对 1.203 s）、相当的显存、更高保真度（39.34 dB 对 29.07 dB）、并发 8 下持平或更高的吞吐（1.233 对 1.218 images/s）——且无需特制 checkpoint。离线路径保留两项优势：更小的磁盘占用，以及用于更深显存压缩的混合 FP8/NVFP4 选项。
-
 ## 结论
 
-对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 Qwen-Image-2512，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。本硬件上推荐以在线 FP8 为默认：它是 SM103 上唯一可用的在线低精度方法，相对 BF16 近乎无损，且在无需特制产物的情况下持平或胜过离线 FP8。当磁盘占用或峰值显存是约束瓶颈时，离线混合 FP8/NVFP4 仍是合适之选。
+对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 Qwen-Image-2512，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。单流延迟敏感场景下 BF16 仍更优；追求吞吐时优先量化，其中混合 FP8/NVFP4 在并发下最快、峰值显存也最低。本文是该系列的第一篇，后续将展开在线量化、内核细节与更多模型上的实践。

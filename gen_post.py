@@ -17,7 +17,7 @@ C = {"bf16": "#6C7A89", "online_fp8": "#76b900", "fp8": "#1B5A8E", "mixed": "#BD
 NAME = {"bf16": "BF16", "online_fp8": "在线 FP8", "fp8": "离线 ModelOpt FP8", "mixed": "混合 FP8/NVFP4"}
 
 def line_chart(series, cats, ymax, w=720, h=350, ylab="吞吐 (images/s)"):
-    pl, pr, pt, pb = 54, 150, 18, 42
+    pl, pr, pt, pb = 54, 34, 18, 42
     pw, ph = w - pl - pr, h - pt - pb
     X = lambda i: pl + pw * i / (len(cats) - 1); Y = lambda v: pt + ph * (1 - v / ymax)
     s = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg" class="chart">']
@@ -36,11 +36,14 @@ def line_chart(series, cats, ymax, w=720, h=350, ylab="吞吐 (images/s)"):
         for i, v in enumerate(vals):
             s.append(f'<circle cx="{X(i):.1f}" cy="{Y(v):.1f}" r="4" fill="{col}"/>')
         s.append(f'<text x="{X(len(vals)-1)+8:.1f}" y="{Y(vals[-1])+4:.1f}" class="pt" fill="{col}">{vals[-1]:.3f}</text>')
-    ly = pt + 2
+    # legend — anchored to the bottom-right corner of the plot
+    lw = 150; lx = pl + pw - lw; ly0 = pt + ph - (len(series) * 22) - 8
+    s.append(f'<rect x="{lx-8}" y="{ly0-4}" width="{lw+10}" height="{len(series)*22+8}" rx="3" fill="#ffffff" opacity="0.72"/>')
+    ly = ly0
     for k, _ in series:
-        s.append(f'<rect x="{pl+pw+26}" y="{ly}" width="12" height="12" rx="2" fill="{C[k]}"/>')
-        s.append(f'<text x="{pl+pw+43}" y="{ly+10}" class="leg">{NAME[k]}</text>')
-        ly += 23
+        s.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" rx="2" fill="{C[k]}"/>')
+        s.append(f'<text x="{lx+18}" y="{ly+10}" class="leg">{NAME[k]}</text>')
+        ly += 22
     s.append("</svg>"); return "".join(s)
 
 def bar_chart(items, ymax, ylab="", fmt="{:.0f}", w=720, h=300):
@@ -112,7 +115,7 @@ gallery = '''<figure>
 md = f'''---
 slug: "/blog/modelopt-fp8-nvfp4"
 date: "2026-06-05"
-title: "在 B300 上实测 vLLM-Omni 的 FP8 与 NVFP4 量化"
+title: "vLLM-Omni 量化推理实践(1)"
 description: "Qwen-Image-2512 的 FP8 / 混合 FP8/NVFP4：显存、保真度与并发吞吐。"
 ---
 
@@ -166,37 +169,9 @@ vllm serve Qwen/Qwen-Image-2512 --omni --tensor-parallel-size 2 --quantization f
 
 该交叉是核心的运行结论：对延迟敏感的单流服务，本硬件上 BF16 仍更优；对吞吐导向的批处理服务，量化配置全面占优。这一“随机制依赖”与上游 Qwen3-Omni W4A4 工作（PR #4025）一致——量化优势同样在并发下、而非单流延迟中显现。
 
-## FP8 路径的批处理缺陷及其修复
-
-离线 ModelOpt FP8 路径在 `--max-num-seqs 1` 下服务正常，但一旦在 step execution 下批处理两条序列即确定性失败。编译后、序列打包的激活非连续，而内核试图用 `Tensor.view` 重解释它——这在 `torch.compile` 的 fake-tensor 追踪下对非连续存储非法：
-
-```text
-torch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake tensor call
-  File ".../layers/quantization/modelopt.py", line 611, in apply
-  File ".../kernels/linear/scaled_mm/ScaledMMLinearKernel.py", line 134, in apply_weights
-    x_2d = x.view(-1, x.shape[-1])
-```
-
-修复极小：将 `Tensor.view` 改为 `Tensor.reshape`——后者在布局允许时返回视图，仅在不可能时才拷贝：
-
-```diff
--    x_2d = x.view(-1, x.shape[-1])
-+    x_2d = x.reshape(-1, x.shape[-1])
-```
-
-修复后，离线 FP8 路径在所有测试并发下均无错批处理，并贡献了图 4 的吞吐。混合配置从未受影响，因其走 CUTLASS NVFP4 路径而非 scaled-matrix-multiply 内核。在线 FP8 因共用同一路径，该修复同样适用。其长期归宿应是上游 `vllm-project/vllm`（已作为 PR #4155 提交）。
-
-## Blackwell Ultra 上的在线量化支持
-
-对四种在线方法分别以对应标志服务 BF16 checkpoint，结果见下表：本硬件上仅 FP8 可用，其余三者因不同的内核级原因在加载时失败。
-
-{table2}
-
-值得注意的是，尽管文档将 Int8 列为“Blackwell SM100+”支持，INT8 W8A8 内核却拒绝 SM103，表明存在 Blackwell Ultra 特有的“文档—内核”落差。在本模型与硬件上，在线 FP8 在各维度均持平或略胜离线 ModelOpt FP8——更低延迟（{cmp['online_fp8']['latency_s']:.3f} s 对 {cmp['offline_modelopt_fp8']['latency_s']:.3f} s）、相当的显存、更高保真度（{cmp['online_fp8']['psnr_db']} dB 对 {cmp['offline_modelopt_fp8']['psnr_db']} dB）、并发 8 下持平或更高的吞吐（{cmp['online_fp8']['img_s_c8']} 对 {cmp['offline_modelopt_fp8']['img_s_c8']} images/s）——且无需特制 checkpoint。离线路径保留两项优势：更小的磁盘占用，以及用于更深显存压缩的混合 FP8/NVFP4 选项。
-
 ## 结论
 
-对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 {fam}，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。本硬件上推荐以在线 FP8 为默认：它是 SM103 上唯一可用的在线低精度方法，相对 BF16 近乎无损，且在无需特制产物的情况下持平或胜过离线 FP8。当磁盘占用或峰值显存是约束瓶颈时，离线混合 FP8/NVFP4 仍是合适之选。
+对于通过 vLLM-Omni 服务、运行在 NVIDIA B300 上的 {fam}，FP8 与混合 FP8/NVFP4 量化在保持输出保真度的同时回收约 16% 运行显存、缩减 35%–43% checkpoint 体积，并在并发饱和内核后超过 BF16 吞吐。单流延迟敏感场景下 BF16 仍更优；追求吞吐时优先量化，其中混合 FP8/NVFP4 在并发下最快、峰值显存也最低。本文是该系列的第一篇，后续将展开在线量化、内核细节与更多模型上的实践。
 '''
 
 open(OUT, "w", encoding="utf-8").write(md)
