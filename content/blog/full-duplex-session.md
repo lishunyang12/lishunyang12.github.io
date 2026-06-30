@@ -281,6 +281,23 @@ A barge-in tears down only the downstream stages and **keeps stage 0** — the o
 
 </div>
 
+Both beats live on one small state machine — the session moves between *listening* and *responding*, and barge-in is the edge that returns it without dropping the memory:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> LISTENING: input.append
+    LISTENING --> LISTENING: input.append · keep listening
+    LISTENING --> RESPONDING: commit / response.create · begin_response (capture epoch)
+    RESPONDING --> RESPONDING: input.append · listen WHILE speaking
+    RESPONDING --> LISTENING: response.done (not stale)
+    RESPONDING --> LISTENING: barge-in · epoch++ → old reply goes stale, stage 0 KV kept
+    LISTENING --> CLOSED: close
+    RESPONDING --> CLOSED: close
+```
+
+Two edges make it *full-duplex* rather than turn-based. The **self-loop on `RESPONDING`** — `input.append` keeps feeding the model *while it speaks* — is the duplex property; a half-duplex machine has no such edge. And **barge-in is an epoch bump, not a state**: `begin_response` captures the epoch, every emitted chunk checks `is_stale(epoch)`, and a new response or a cancel just does `epoch++` — instantly invalidating the in-flight reply while stage 0's KV stays resident. So "interrupt me" isn't a transition you draw; it's a generation counter that ages out the old activity.
+
 Net: #3907 **declares** the full capability surface (patterns, input modes, signal sources) but **defers** the scheduler-owned KV *lease* itself — today `supports_core_kv_lease` is a flag and stage 0 is simply kept resumable. Verified on H20: `stale_audio_delta_count=0` (barge-in really drops the stale stream).
 
 <details><summary>Deep dive — Track A internals: the file walk, the session object, the code</summary>
