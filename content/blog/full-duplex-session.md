@@ -7,6 +7,8 @@ description: "A descriptive walk through full-duplex interaction serving in vLLM
 
 This is a **map, not a verdict**. Full-duplex interaction serving in vLLM-Omni is an active design — [RFC #3745](https://github.com/vllm-project/vllm-omni/issues/3745) is open, two implementations are landing from different directions, and several core questions are still being argued in the thread. The goal here is to lay out the shared ground everyone agrees on, then put the open decisions on the table — with their advocates — so the room has a common picture to argue from.
 
+> **Short on time? Jump to [Part 3](#part-3).** The decision matrix there *is* the agenda — nine questions in three themes. Parts 1–2 are the shared context you need to argue them.
+
 ## What we mean by full-duplex
 
 Full-duplex voice is the "Doubao / Gemini Live / GPT-4o voice" experience: no push-to-talk, no turn button. You can interrupt the model mid-sentence, it listens and speaks at the same time, a single conversation context stays alive for minutes, and barge-in lands under 300–400 ms. A new class of models — MiniCPM-o 4.5 (Omni-Flow), Nemotron VoiceChat, SoulX-Duplug, Moshi, PersonaPlex on the audio side; JoyAI-VL on the vision side — are **full-duplex by design**: they perceive and respond *concurrently*.
@@ -410,38 +412,71 @@ flowchart LR
 
 ---
 
-# Part 3 — What's still open
+<a id="part-3"></a>
 
-Here are the live forks from the RFC thread, presented as options with their advocates. None is settled; this is the agenda for the room.
+# Part 3 — What we're deciding (the agenda)
 
-**① We already have two `DuplexSession` abstractions.** #3907 built one in `engine/duplex.py`; #4575 built another in `experimental/fullduplex/core/`. Neither uses the other — the exact fragmentation the RFC set out to prevent.
-- **(A)** Converge into one model-agnostic core. **(B)** Keep two (native-audio vs orchestration-vision). **(C)** One shared API, two backend implementations.
-- *In the thread:* the RFC's stated goal is "define the primitive once"; in practice two shipped independently.
+This is the open part. Nine questions are live in the [RFC #3745](https://github.com/vllm-project/vllm-omni/issues/3745) thread; none is settled. Here they are in one view, then grouped into three themes — **Structure**, **Semantics**, **Targets** — each with the concrete code that makes the fork real.
 
-**② Native engine vs out-of-process orchestration.**
-- **(A)** Two backends of one core, chosen by latency tier. **(B)** Native is the destination, orchestration the day-0 stopgap. **(C)** Two independent tracks for two use-cases.
+<div class="table-caption">The decision matrix — the whole agenda on one screen.</div>
+<table>
+<thead><tr><th>#</th><th>Decision</th><th>Options on the table</th><th>Argued by</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>①</td><td>One session core, or two?</td><td>converge · keep two · one API / two backends</td><td>RFC intent vs #3907 &amp; #4575</td><td><strong>two already shipped</strong></td></tr>
+<tr><td>②</td><td>Native engine vs orchestration</td><td>two backends of one core · native is the destination · two tracks</td><td>#3907, #4575</td><td>open</td></tr>
+<tr><td>⑥</td><td>Where session management lives</td><td>orchestrator · coordinator · separate layer · new orchestrator type · engine↔executor wrapper</td><td>yinpeiqi, Gaohan, TKONIY, Nightwing-77</td><td>open</td></tr>
+<tr><td>⑧</td><td>One home for all models?</td><td><code>experimental/fullduplex/</code> as adapters · stay put</td><td>open call</td><td>split today</td></tr>
+<tr><td>③</td><td>Who owns turn-taking</td><td>DUPLEX_VAD only · optional (self-VAD) · multi-source TurnController</td><td>tc-mb, Sy0307</td><td>open</td></tr>
+<tr><td>④</td><td>KV-lease scope &amp; eviction</td><td>stage-0 only vs all · reject / evict / compress</td><td>yinpeiqi, author</td><td>open</td></tr>
+<tr><td>⑤</td><td>Append semantics</td><td>default mode · one declared capability among many</td><td>Sy0307, linyueqian</td><td>open</td></tr>
+<tr><td>⑦</td><td>Single- vs multi-session first</td><td>single first, then scale</td><td>tc-mb (+ several)</td><td>leaning single</td></tr>
+<tr><td>⑨</td><td>Latency tiers &amp; function calling</td><td>pin a barge-in floor per phase · keep ZMQ+SHM swappable</td><td>linyueqian, vklimkov, Liangtaiwan</td><td>open</td></tr>
+</tbody>
+</table>
 
-**③ Who owns turn-taking?**
-- **(A)** `DUPLEX_VAD` is the single owner. **(B)** Optional — an end-to-end model self-VADs; VAD only for cascades (tc-mb). **(C)** A `TurnController` fed by *multiple* signal sources — VAD, model token, client event, server policy (Sy0307).
+## Theme 1 — Structure: how many abstractions, and where? (①②⑥⑧)
 
-**④ KV lease — scope and eviction.**
-- *Scope:* stage-0/thinker only (downstream stages are epoch-flushable — yinpeiqi) vs all session stages.
-- *Under memory pressure:* reject new + TTL-GC, vs evict oldest session, vs compress (sink+window). (author's open question)
+The headline fact: **there are already two `DuplexSession`s in the same repo, and neither imports the other.**
 
-**⑤ Append semantics.**
-- **(A)** Append is the default input mode. **(B)** Append is one *declared capability* among several (replace-latest / re-encode / rollback), gated by `session_mode: turn | duplex` so the six existing TTS pipelines never regress (Sy0307, linyueqian).
+```python
+from vllm_omni.engine.duplex import DuplexSessionRuntimeState        # #3907 — native, in-engine
+from vllm_omni.experimental.fullduplex.core import DuplexSession      # #4575 — orchestration
+# two independent answers to the question the RFC meant to settle once.
+```
 
-**⑥ Where session management lives.**
-- Orchestrator main path · folded into the Coordinator (yinpeiqi) · a separate layer/process · a new session-based orchestrator type (Gaohan) · a wrapper between engine and model executor (Nightwing-77). Naming/boundaries flagged as unclear (TKONIY).
+- **①** converge into one model-agnostic core · keep two (native-audio vs orchestration-vision) · one shared API with two backends.
+- **②** treat native (#3907) and orchestration (#4575) as two backends of one core, chosen by latency tier · native as the destination, orchestration the day-0 stopgap · two independent tracks.
+- **⑥** where the session object lives — orchestrator main path · the coordinator (yinpeiqi) · a separate layer · a new session-based orchestrator type (Gaohan) · a wrapper between engine and executor (Nightwing-77); boundaries flagged unclear (TKONIY).
+- **⑧** whether every model moves under `experimental/fullduplex/` as a capability-declaring adapter, or stays put (today #3907 is in `model_executor` + `entrypoints`; #4575/#4771 are under `experimental/fullduplex`).
 
-**⑦ Single-session first, or multi-session in Phase 1?**
-- Broad lean toward single-session first — land the primitive shape before admission control / fairness (tc-mb, agreed by several).
+## Theme 2 — Semantics: turn-taking, KV lease, append (③④⑤)
 
-**⑧ One home for all full-duplex models?**
-- Should every model live under `experimental/fullduplex/` as a capability-declaring adapter, or stay where it is (today #3907 is in `model_executor` + `entrypoints`, #4575/#4771 are under `experimental/fullduplex`)?
+Two of these are *already enums in #3907* — so the fork isn't "invent something," it's "which members become canonical and required."
 
-**⑨ Latency tiers and function calling.**
-- Pin each phase to a barge-in floor it commits to — sub-300 ms needs sub-chunk cancel + `audio_end_ms` truncate + mandatory VAD (linyueqian). Keep `core ↔ client` transports (ZMQ + SHM) interchangeable for closed-loop function calling — running the thinker without user input to produce a call, then "prefilling in the middle" (vklimkov-nvidia). And lockstep models (Liangtaiwan) need a non-token side-channel payload, a frame-budgeted stop, and a deploy-time prewarm pass.
+```python
+class DuplexSignalSource(str, Enum):   # ③ — who may declare a "turn"?
+    MODEL_NATIVE = "model_native"
+    EXTERNAL_VAD = "external_vad"
+    CLIENT_EVENT = "client_event"
+    SERVER_POLICY = "server_policy"
+    DIALOGUE_STATE_MODEL = "dialogue_state_model"
+
+class DuplexInputMode(str, Enum):      # ⑤ — is "append" the default, or one of these?
+    APPEND_AUDIO_CHUNK = "append_audio_chunk"
+    REPLACE_LATEST_CHUNK = "replace_latest_chunk"
+    REENCODE_CONTEXT = "reencode_context"
+    ROLLBACK_TO_CHECKPOINT = "rollback_to_checkpoint"
+    TURN_COMMIT_ONLY = "turn_commit_only"
+```
+
+- **③** is `DUPLEX_VAD` the single owner · optional, since an end-to-end model self-VADs (tc-mb) · or one of *many* sources behind a `TurnController` (Sy0307)?
+- **④** does the KV lease cover stage-0/thinker only — downstream stages are epoch-flushable (yinpeiqi) — or all stages? Under memory pressure: reject + TTL-GC · evict oldest · compress (sink+window)?
+- **⑤** is append the default, or one *declared capability* among several, gated by `session_mode: turn | duplex` so the six existing TTS pipelines never regress (Sy0307, linyueqian)?
+
+## Theme 3 — Targets: scope and latency (⑦⑨)
+
+- **⑦** single-session first — land the primitive shape before admission control / fairness (tc-mb, agreed by several).
+- **⑨** pin each phase to a barge-in floor it commits to (≈1 s / 300 ms / 80 ms). Sub-300 ms needs sub-chunk cancel + `audio_end_ms` truncate + mandatory VAD (linyueqian). Keep `core ↔ client` transports (ZMQ + SHM) swappable for closed-loop function calling — run the thinker with no user input to produce a call, then "prefill in the middle" (vklimkov-nvidia). Lockstep models need a non-token side-channel payload + a frame-budgeted stop + a deploy-time prewarm pass (Liangtaiwan).
 
 ## Phases, as proposed
 
