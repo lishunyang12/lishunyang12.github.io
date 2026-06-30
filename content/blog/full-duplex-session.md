@@ -345,7 +345,17 @@ def acknowledge(self, played_ms, committed_ms=None):
 
 The audio track isn't the only one. [JoyAI-VL-Interaction](https://arxiv.org/abs/2606.14777) is a **vision-first** interaction model: an 8B Qwen3-VL-shaped model retrained so that *deciding when to speak is a learned capability*. Watching video at 1 Hz, every second it emits `</silence>` (keep watching), `</response>` (speak now), or **delegates** to a background model — the loop from the intro, triggered by what it *sees*.
 
-[PR #4575](https://github.com/vllm-project/vllm-omni/pull/4575) lands its serving layer — and takes the **opposite road** from #3907. Instead of a native in-engine session, it's a thin **out-of-process orchestrator** in front of a plain `vllm serve`, leaning on vLLM's automatic radix prefix cache for KV reuse.
+[PR #4575](https://github.com/vllm-project/vllm-omni/pull/4575) lands its serving layer — and takes the **opposite road** from RFC #3745 and #3907. The RFC and Track A make the *engine* stateful: a `DuplexSession` owns the conversation and the scheduler **leases** its KV across turns, so context lives as **resident KV inside the engine**. #4575 inverts that. The engine stays a **stateless, vanilla `vllm serve`**; every bit of conversation state lives in a separate orchestrator process; and context is **never held as resident KV — it is rebuilt from a compact memory every tick and replayed through vLLM's automatic prefix cache.** Three off-the-shelf parts, no engine surgery: a stateless model server, a Python session object, and the prefix cache.
+
+<table>
+<tr><th>Where does context live?</th><th>RFC #3745 / Track A (#3907)</th><th>Track B (#4575, JoyAI-VL)</th></tr>
+<tr><td>the engine</td><td>stateful — owns the session</td><td><strong>stateless</strong> — vanilla <code>vllm serve</code></td></tr>
+<tr><td>the conversation</td><td><code>DuplexSession</code> inside the engine</td><td><code>InteractionSession</code> in a sidecar</td></tr>
+<tr><td>KV across turns</td><td>scheduler <strong>leases</strong> it (resident)</td><td>reused via <strong>automatic prefix cache</strong></td></tr>
+<tr><td>hours-long context</td><td>kept live in KV</td><td><strong>compacted to text memory</strong>, re-sent each tick</td></tr>
+</table>
+
+So Track B's whole game is *prompt engineering for the cache*: hold the conversation in a tiered text memory, lay it out so the head never moves, and let the stock engine do KV reuse for free. The rest of this section is how those pieces fit.
 
 It lives under `vllm_omni/experimental/fullduplex/`, and the split is worth getting right (the README is explicit about it):
 
@@ -378,21 +388,46 @@ Note this `core/` `DuplexAdapter` is a *second*, independent abstraction from #3
 <figcaption>Figure 5. JoyAI-VL's deployable system (<a href="https://arxiv.org/abs/2606.14777">arXiv:2606.14777</a>, Fig. 3): a browser/RTSP client → live web backend → inference adapter → the interaction model + background brain + long-horizon memory. The model is the only component that decides when to speak or delegate; everything else is transduction and orchestration around it.</figcaption>
 </figure>
 
+### The per-second loop — the model decides
+
+There are three independent clocks here, and conflating them is the easy mistake:
+
+- **tick** = one frame (~1 s) — one model decision;
+- **chunk** = 100 frames (~100 s) — the *memory* buffer (when summarization fires);
+- **query** = a human-driven span that rides across *many* chunks.
+
+Each sampled frame is **one stateless POST**. Turn-taking isn't a separate VAD module — it's the model choosing, every tick, between `</silence>` / `</response>` / `</delegation>`. The orchestrator wraps that choice with exactly two rules:
+
+- **Before** the model: a **force-silence gate** — until the *first* query of the session, idle frames short-circuit to `</silence>` with **no model call at all**. Once a query is armed, the gate is dead and every tick runs a forward pass (even to decide "stay quiet").
+- **After** the model: **dedup** — a `</response>` whose text repeats the last *spoken* line collapses back to silence; an intervening genuine silence resets the comparison, so the same line can fire again once the scene has moved on.
+
+The subtle, important part: **a query arms continuous evaluation — it does not force a reply.** "Tell me when the water boils" keeps emitting `</silence>` tick after tick while the pot isn't boiling, then speaks the instant a frame shows it. The model re-judges every second whether the *current* visual evidence now answers the standing query.
+
+<div class="insight">
+
+**The query is a standing instruction, not a trigger.** It arms the model to re-evaluate every frame; the model speaks only when what it *sees* earns it. Silence is the default, and it's the model's own decision — not a timer, not a rule.
+
+</div>
+
 ### Keeping the conversation contextualized
 
-A two-hour stream never fits in the context window, so the orchestrator doesn't *grow* the input — every tick it **rebuilds a compact context prefix from memory and prepends it** to the live frame. The 3-tier brain feeds it:
+A two-hour stream never fits in the context window, so the orchestrator doesn't *grow* the input — every tick it **rebuilds a compact context prefix from memory and prepends it** to the live frame. The 3-tier brain feeds it (with `frame_seconds = 1.0`, the clock below is in real seconds):
 
-- **short-term** — the last few raw frames (what's happening *now*);
-- **mid-term** — text summaries of older chunks, each tagged with its frame range;
-- **long-term** — a compressed digest of the whole session.
+- **short-term** — the live chunk, raw frames (what's happening *now*), up to **100 frames ≈ 100 s**;
+- **mid-term** — one text summary **per closed chunk** (100 frames → 1 summary), each tagged with its frame range;
+- **long-term** — every **5 mid-terms roll up** into one compressed block; a sliding window keeps the last **15 blocks ≈ 2 h**.
+
+A chunk actually carries **two stores** — `working_frames` (video only) and `chunk.messages` (the live transcript) — and at the 100-frame boundary they drain into *different* tiers: the **video** becomes a mid-term summary, while the **query + its replies** are archived into a separate **Q&A history**. The raw transcript itself is dropped. So a spoken reply lives in Q&A history, **never** in the visual summaries — the two halves of the conversation are remembered through two different channels and only recombine in the prompt prefix.
 
 ```mermaid
 flowchart LR
     subgraph mem["3-tier memory"]
         direction TB
-        st["short-term<br/>recent raw frames"]
-        mt["mid-term<br/>chunk summaries"]
-        lt["long-term<br/>compressed digest"]
+        st["short-term<br/>live chunk · ≤100 frames"]
+        mt["mid-term<br/>1 summary / 100 frames"]
+        lt["long-term<br/>roll-up every 5 · window 15 (~2h)"]
+        st -. "100 frames<br/>summarize" .-> mt
+        mt -. "every 5<br/>roll-up" .-> lt
     end
     mem --> pre["context prefix<br/>(byte-stable head)"]
     pre --> inp["model input, this tick"]
@@ -401,7 +436,12 @@ flowchart LR
     model -. "head unchanged → prefix-cache hits" .-> pre
 ```
 
-`build_memory_prefix` stitches these into one text block — *video history* (long-term + mid-term) + *Q&A history* + the *standing query* — that rides in front of the frame. The subtle part is what it **withholds**: a *newly issued* query is **not** spliced into the head; it goes into the current tick's appended message instead. That keeps the head byte-identical across ticks, so vLLM's radix prefix cache hits and the growing history is never re-prefilled — Track B's entire KV-reuse strategy in one rule.
+`build_memory_prefix` stitches these into one text block — *video history* (long-term + mid-term) + *Q&A history* + the *standing query* — that rides in front of the frame. Two properties make it cache-friendly:
+
+- **Its inputs are frozen for the whole chunk.** Mid-term, long-term, and the archived Q&A only change at a chunk **boundary** (the summarizer runs in the background and appends), and the boundary resets the chunk anyway. So across the ~100 ticks *within* a chunk, `build_memory_prefix` returns the **same bytes** every time. The memory layout is also **append-only at the durable end**, so even across boundaries the *leading* lines stay identical and keep hitting the cache.
+- **It withholds the volatile query.** A *newly issued* query is **not** spliced into the head; it rides in the current tick's appended message instead, and only migrates into the head (as history) once its chunk closes. The query is the thing that changes most often, so keeping it out of the head is what prevents the most frequent cache-busting event.
+
+Net: the head is byte-identical across ticks, vLLM's radix prefix cache hits, and the hours-long history is never re-prefilled — only the one new frame at the tail. That's Track B's entire KV-reuse strategy, with no engine session and no KV lease.
 
 <div class="insight">
 
