@@ -87,6 +87,8 @@ Two substrate capabilities matter later: **streaming stage output (`async_chunk`
 <figcaption>Figure 3. Async-chunk streaming (official meetup deck): the Thinker→Talker→Code2Wav chain emits <code>text_i</code> and <code>audio_i</code> as they're computed.</figcaption>
 </figure>
 
+**Qwen3-Omni** is the canonical example: a three-stage `Thinker(LLM) → Talker(LLM) → Code2Wav` pipeline that already *streams* beautifully (Figure 3) — the Talker emits a token, Code2Wav speaks it, overlapped. But it's still **turn-based**: you finish, *then* it thinks and replies. It's the model the counter serves perfectly — one request in, one streamed answer out, KV freed at the end. Full-duplex is the *same* stage graph asked to **listen while it speaks** — and that's where the counter breaks.
+
 This substrate is strong — up to 91.4% lower job-completion time versus baseline. **But it is request-oriented.** A request goes `prefill → decode → finish`, and at finish its KV blocks return to the manager.
 
 ## The impedance mismatch
@@ -318,16 +320,12 @@ The audio track isn't the only one. [JoyAI-VL-Interaction](https://arxiv.org/abs
 
 [PR #4575](https://github.com/vllm-project/vllm-omni/pull/4575) lands its serving layer — and takes the **opposite road** from #3907. Instead of a native in-engine session, it's a thin **out-of-process orchestrator** in front of a plain `vllm serve`, leaning on vLLM's automatic radix prefix cache for KV reuse.
 
-It lives under `vllm_omni/experimental/fullduplex/` in two halves:
+It lives under `vllm_omni/experimental/fullduplex/`, and the split is worth getting right (the README is explicit about it):
 
-- **`core/`** — model-agnostic: `DuplexRuntime` / `DuplexSession` / `DuplexAdapter`, epoch barge-in, streaming.
-- **`joyvl/`** — the implementation:
-    - `decision/` — the silence / respond / delegate policy;
-    - `memory/` — a 3-tier brain (raw frames → text summaries → compressed long-term), shaped for prefix-cache reuse;
-    - `serving/` — the OpenAI-compatible orchestrator;
-    - `bridges/` — pluggable ASR / TTS + background delegation.
+- **`joyvl/serving/` is the live path** — an `InteractionSession` driving `decision/` (the silence / respond / delegate policy) and a 3-tier `memory/` (raw frames → text summaries → compressed long-term, shaped for prefix-cache reuse) **directly**, with `bridges/` for pluggable ASR / TTS + background delegation.
+- **`core/`** (`DuplexRuntime` / `DuplexSession` / `DuplexAdapter`) is a **model-agnostic scaffold** — a demonstration of how a model *would* plug into a generic full-duplex framework, exercised only by tests today. Per its own README it's "built for" fused-audio models like MiniCPM-o — which is exactly the irony in decision ① below: #3907 built its own instead of using it.
 
-<details><summary>Code — the model-agnostic adapter JoyVL shipped (core/adapter.py)</summary>
+<details><summary>Code — the generic adapter seam (core/adapter.py — a demonstration, test-only)</summary>
 
 ```python
 class DuplexAdapter(ABC):
@@ -344,7 +342,7 @@ class DuplexAdapter(ABC):
     async def on_playback_ack(self, session, cursor: int) -> None: ...
 ```
 
-Note this is a *second* `DuplexAdapter`, independent of #3907's — see decision ① in Part 3.
+Note this `core/` `DuplexAdapter` is a *second*, independent abstraction from #3907's — and a test-only scaffold, not JoyVL's live path. See decision ① in Part 3.
 
 </details>
 
@@ -444,12 +442,16 @@ This is the open part. Nine questions are live in the [RFC #3745](https://github
 
 ## Theme 1 — Structure: how many abstractions, and where? (①②⑥⑧)
 
-The headline fact: **there are already two `DuplexSession`s in the same repo, and neither imports the other.**
+The headline fact: the repo already holds **session abstractions that don't share code** — and the one *meant* to be reusable (`core/`) isn't even on JoyVL's live path:
 
 ```python
-from vllm_omni.engine.duplex import DuplexSessionRuntimeState        # #3907 — native, in-engine
-from vllm_omni.experimental.fullduplex.core import DuplexSession      # #4575 — orchestration
-# two independent answers to the question the RFC meant to settle once.
+# #3907 (MiniCPM, native) — the live session:
+from vllm_omni.engine.duplex import DuplexSessionRuntimeState
+# #4575 (JoyVL, orchestration) — the live session:
+from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionSession
+# #4575 also ships a generic scaffold, built "for fused-audio models like MiniCPM-o" —
+# yet #3907 built its own and never used it:
+from vllm_omni.experimental.fullduplex.core import DuplexSession   # demonstration / tests only
 ```
 
 - **①** converge into one model-agnostic core · keep two (native-audio vs orchestration-vision) · one shared API with two backends.
