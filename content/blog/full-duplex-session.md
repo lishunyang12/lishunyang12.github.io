@@ -136,6 +136,19 @@ flowchart TB
 
 The load-bearing pieces: a **KV lease** (blocks not freed on segment finish, only on close), **duplex-append mode** (keep `num_computed_tokens`, extend the block table), an **adaptive coalescing window** (wait briefly so late chunks still batch), a **SHM direct-ingress ring** (skip the ZMQ round-trip), and **epoch barge-in** (every chunk carries `(session, turn, epoch)`; a barge-in bumps the epoch and stages drop stale work — never the KV).
 
+<details><summary>Code — the stage interface a model plugs into (RFC #3745)</summary>
+
+```python
+class StageDuplexClient(StagePoolClient, Protocol):
+    def open_session(self, sid: str, params: DuplexSessionParams) -> None: ...
+    def push_chunk(self, sid: str, chunk: DuplexChunk) -> None: ...        # SHM ring, not ZMQ
+    def signal_turn(self, sid: str, event: TurnEvent) -> None: ...
+    def barge_in(self, sid: str, epoch: int, scope: Literal["current", "all"]) -> None: ...
+    def close_session(self, sid: str) -> None: ...
+```
+
+</details>
+
 ## One primitive, many model shapes
 
 The reason a shared primitive is worth the trouble: full-duplex models share almost nothing structurally *except* needing persistent KV. Two audio models from the thread look nothing alike.
@@ -161,6 +174,7 @@ flowchart LR
         n1["every ~30 ms:<br/>one audio frame in"] --> n2["one word out +<br/>one 'what I heard' out"] --> n3["TTS speaks,<br/>one step behind"]
         n3 -. "cut in any tick —<br/>engine must enforce it" .-> n1
     end
+    M ~~~ N
 ```
 
 These different clocks set hard **barge-in latency floors** and force a duplex adapter to support **three injection patterns**, not one:
@@ -195,9 +209,73 @@ flowchart LR
     s0 -. "listen: stay silent,<br/>keep the memory" .-> sess
 ```
 
-Its session primitive lives in **`engine/duplex.py`**, and the type system reads like a checklist of the review feedback (see Part 3): `SessionMode`, `DuplexAdapterPattern`, `DuplexInputMode`, `DuplexSignalSource`, `DuplexRuntimeCapabilities`, `DuplexPlaybackCommitCursor`, `DuplexStageBinding`, `DuplexSessionRuntimeState/Manager`.
+**The path a chunk takes.** The PR is ~27k lines, but the duplex flow is a straight line through four files:
 
-One concept worth a picture — the **playback cursor**: the model commits to memory only what you *actually heard*, not what it streamed. A barge-in cuts the line between "sent" and "heard."
+- `entrypoints/openai/serving_duplex.py` — the WebSocket handler: parse a frame, drive the session, emit `response.audio.delta`.
+- `engine/duplex.py` — the session state + manager (below); routes the append through the duplex data plane, not a fake chat request.
+- `models/minicpmo_4_5/duplex_runtime.py` + `duplex_policy.py` — Stage 0: MiniCPM's listen/speak decode, via the `worker/native_duplex.py` hooks.
+- `minicpmo_4_5_omni_tts.py` — Stage 1: on `speak`, Stage 0's hidden states hand off to TTS / token2wav, which streams audio back.
+
+### The session object — `DuplexSessionRuntimeState`
+
+One per call (held by `DuplexSessionRuntimeManager`). It owns four things:
+
+- **one long-lived resumable request per stage** — `bind_stage_request(stage_id, request_id)`; stage 0's binding carries `lease_active = capabilities.supports_core_kv_lease`.
+- **a declared capability surface** — `append_input(payload, mode=…)` *rejects* any `DuplexInputMode` the model didn't declare.
+- **the playback cursor** — `acknowledge_playback(played_ms, committed_ms)`.
+- **the barge-in rule** — `barge_in()` bumps the epoch and tears down only `stage_id > 0`, **preserving stage 0** (the request that owns the conversation KV). This is the "keep the memory" arrow above, made literal:
+
+<details><summary>Code — barge-in preserves stage 0 (engine/duplex.py)</summary>
+
+```python
+def barge_in(self) -> tuple[int, list[str]]:
+    # Stage0 is the long-lived resumable request that owns the conversation
+    # KV/context. A barge-in stops downstream output but PRESERVES stage0 so
+    # conversation memory survives. Only stage_id > 0 are torn down.
+    stale = [b.request_id for sid, b in self.stage_bindings.items() if sid != 0]
+    self.epoch += 1
+    self.pending_inputs.clear()
+    self.stage_bindings = {sid: b for sid, b in self.stage_bindings.items() if sid == 0}
+    return self.epoch, stale
+```
+
+</details>
+
+The capability surface is the heart of the design — a model declares its shape, the runtime adapts:
+
+<details><summary>Code — the capability enums (engine/duplex.py)</summary>
+
+```python
+class SessionMode(str, Enum):
+    TURN = "turn"
+    DUPLEX = "duplex"
+
+class DuplexAdapterPattern(str, Enum):
+    CHUNK_GROUP_APPEND = "chunk_group_append"          # MiniCPM-o 4.5
+    PER_STEP_TENSOR_INJECT = "per_step_tensor_inject"  # Nemotron VoiceChat
+    PARALLEL_FRAME_JOINT = "parallel_frame_joint"      # Moshi-class
+    # … + 4 handoff / data-plane variants
+
+class DuplexInputMode(str, Enum):
+    APPEND_AUDIO_CHUNK = "append_audio_chunk"
+    REPLACE_LATEST_CHUNK = "replace_latest_chunk"
+    REENCODE_CONTEXT = "reencode_context"
+    ROLLBACK_TO_CHECKPOINT = "rollback_to_checkpoint"
+    TURN_COMMIT_ONLY = "turn_commit_only"              # append is one mode among several (decision ⑤)
+
+class DuplexSignalSource(str, Enum):
+    MODEL_NATIVE = "model_native"                      # the model self-VADs
+    EXTERNAL_VAD = "external_vad"
+    CLIENT_EVENT = "client_event"
+    SERVER_POLICY = "server_policy"                    # turn-taking from many sources (decision ③)
+    DIALOGUE_STATE_MODEL = "dialogue_state_model"
+```
+
+</details>
+
+### The playback cursor — four watermarks
+
+`DuplexPlaybackCommitCursor` keeps four monotonic millisecond marks — `generated → sent → played → committed` — and **only `committed` enters memory**. A barge-in between `sent` and `played` discards audio the user never heard.
 
 ```mermaid
 flowchart LR
@@ -206,18 +284,114 @@ flowchart LR
     s -. "barge-in here: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
 ```
 
-#3907 explicitly **defers** the full scheduler-owned KV lease (allocation / rollback / migration / release), landing the control semantics first. Its H20 end-to-end run reports `overlap_listen=true`, `playback_commit_ok=true`, and `stale_audio_delta_count=0` (barge-in drops the stale stream).
+<details><summary>Code — the four watermarks (engine/duplex.py)</summary>
+
+```python
+def mark_generated(self, generated_ms): self.generated_ms = max(self.generated_ms, generated_ms)
+def mark_sent(self, sent_ms):           self.sent_ms      = max(self.sent_ms, sent_ms)
+def acknowledge(self, played_ms, committed_ms=None):
+    self.played_ms    = max(self.played_ms, played_ms)
+    self.committed_ms = max(self.committed_ms, committed_ms if committed_ms is not None else played_ms)
+```
+
+</details>
+
+### Declares vs. defers
+
+- **Declares** the full capability surface above — patterns, input modes, signal sources, `supports_core_kv_lease`.
+- **Defers** the scheduler-owned KV *lease* itself (allocation / rollback / migration / release): today `supports_core_kv_lease` is a flag, and stage 0 is simply kept resumable.
+- **Verified** on H20: `overlap_listen=true` · `playback_commit_ok=true` · `stale_audio_delta_count=0` (barge-in drops the stale stream).
 
 ## Track B — vision, orchestration over a plain server (JoyAI-VL, #4575)
 
 The audio track isn't the only one. [JoyAI-VL-Interaction](https://arxiv.org/abs/2606.14777) is a **vision-first** interaction model: an 8B Qwen3-VL-shaped model retrained so that *deciding when to speak is a learned capability*. Watching video at 1 Hz, every second it emits `</silence>` (keep watching), `</response>` (speak now), or **delegates** to a background model — the loop from the intro, triggered by what it *sees*.
 
-[PR #4575](https://github.com/vllm-project/vllm-omni/pull/4575) lands its serving layer — and takes the **opposite road** from #3907. Instead of a native in-engine session, it's a thin **out-of-process orchestrator** in front of a plain `vllm serve`, leaning on vLLM's automatic radix prefix cache for KV reuse. It lives under `vllm_omni/experimental/fullduplex/`: a model-agnostic `core/` (`DuplexRuntime` / `DuplexSession` / `DuplexAdapter`, epoch barge-in, streaming) plus a `joyvl/` implementation — `decision/` (the silence/respond/delegate policy), a 3-tier `memory/` (raw frames → text summaries → compressed long-term, shaped for prefix-cache reuse), `serving/` (the OpenAI-compatible orchestrator), and `bridges/` (pluggable ASR/TTS + background delegation).
+[PR #4575](https://github.com/vllm-project/vllm-omni/pull/4575) lands its serving layer — and takes the **opposite road** from #3907. Instead of a native in-engine session, it's a thin **out-of-process orchestrator** in front of a plain `vllm serve`, leaning on vLLM's automatic radix prefix cache for KV reuse.
+
+It lives under `vllm_omni/experimental/fullduplex/` in two halves:
+
+- **`core/`** — model-agnostic: `DuplexRuntime` / `DuplexSession` / `DuplexAdapter`, epoch barge-in, streaming.
+- **`joyvl/`** — the implementation:
+    - `decision/` — the silence / respond / delegate policy;
+    - `memory/` — a 3-tier brain (raw frames → text summaries → compressed long-term), shaped for prefix-cache reuse;
+    - `serving/` — the OpenAI-compatible orchestrator;
+    - `bridges/` — pluggable ASR / TTS + background delegation.
+
+<details><summary>Code — the model-agnostic adapter JoyVL shipped (core/adapter.py)</summary>
+
+```python
+class DuplexAdapter(ABC):
+    @abstractmethod
+    def capabilities(self) -> DuplexCapability: ...
+    @abstractmethod
+    async def on_input(self, session, modality: str, data) -> None: ...
+    @abstractmethod
+    def respond(self, session) -> AsyncIterator[OutputChunk]: ...
+
+    def should_respond(self, session) -> bool:        # default: always
+        return True
+    async def on_barge_in(self, session) -> None: ...
+    async def on_playback_ack(self, session, cursor: int) -> None: ...
+```
+
+Note this is a *second* `DuplexAdapter`, independent of #3907's — see decision ① in Part 3.
+
+</details>
 
 <figure>
 <img src="/images/joyvl/x3.png" alt="JoyAI-VL deployable system">
 <figcaption>Figure 5. JoyAI-VL's deployable system (<a href="https://arxiv.org/abs/2606.14777">arXiv:2606.14777</a>, Fig. 3): a browser/RTSP client → live web backend → inference adapter → the interaction model + background brain + long-horizon memory. The model is the only component that decides when to speak or delegate; everything else is transduction and orchestration around it.</figcaption>
 </figure>
+
+### Keeping the conversation contextualized
+
+A two-hour stream never fits in the context window, so the orchestrator doesn't *grow* the input — every tick it **rebuilds a compact context prefix from memory and prepends it** to the live frame. The 3-tier brain feeds it:
+
+- **short-term** — the last few raw frames (what's happening *now*);
+- **mid-term** — text summaries of older chunks, each tagged with its frame range;
+- **long-term** — a compressed digest of the whole session.
+
+```mermaid
+flowchart LR
+    subgraph mem["3-tier memory"]
+        direction TB
+        st["short-term<br/>recent raw frames"]
+        mt["mid-term<br/>chunk summaries"]
+        lt["long-term<br/>compressed digest"]
+    end
+    mem --> pre["context prefix<br/>(byte-stable head)"]
+    pre --> inp["model input, this tick"]
+    frame["live frame + new query"] -. "appended, NOT spliced into the head" .-> inp
+    inp --> model["JoyVL model"]
+    model -. "head unchanged → prefix-cache hits" .-> pre
+```
+
+`build_memory_prefix` stitches these into one text block — *video history* (long-term + mid-term) + *Q&A history* + the *standing query* — that rides in front of the frame. The subtle part is what it **withholds**: a *newly issued* query is **not** spliced into the head; it goes into the current tick's appended message instead. That keeps the head byte-identical across ticks, so vLLM's radix prefix cache hits and the growing history is never re-prefilled — Track B's entire KV-reuse strategy in one rule.
+
+<details><summary>Code — assembling the context prefix (joyvl/memory/memory.py)</summary>
+
+```python
+def build_memory_prefix(memory, *, current_query, query_in_current_chunk,
+                        keep_qa_history, current_chunk_index) -> str:
+    sections = []
+    # 1) video history = long-term digest + mid-term chunk summaries
+    history = []
+    if current_query and memory.long_term_memory:
+        history.append(memory.long_term_memory)
+    for e in memory.mid_term_summaries:
+        history.append(f"<{e.frame_range}>\n{e.summary_text}")
+    if history:
+        sections.append(VIDEO_HISTORY_HEADER + "\n\n".join(history))
+    # 2) past Q&A, archived before this chunk
+    if keep_qa_history and current_query:
+        sections.append(QA_HISTORY_HEADER + qa_lines)   # "[Q@t] … [A@t] …"
+    # 3) the standing query — ONLY if it is not already in the current chunk
+    if current_query and not query_in_current_chunk:
+        sections.append(USER_QUERY_HEADER + "\n" + current_query.strip())
+    return "\n\n".join(sections)
+```
+
+</details>
 
 The two tracks differ on where the session lives and how KV is reused:
 
