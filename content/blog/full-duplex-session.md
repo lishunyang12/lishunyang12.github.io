@@ -151,7 +151,7 @@ flowchart TB
     listen -. "you hang up" .-> close(["call ends — memory released"])
 ```
 
-The idea that makes it work: **the KV cache is leased to the call, not to a single reply.** A barge-in throws away the half-spoken answer but never the memory. The RFC sketches it as four thin layers:
+The idea that makes it work: **the KV cache is leased to the call, not to a single reply.** A barge-in throws away the half-spoken answer but never the memory. The RFC sketches it as **four thin layers** — read the diagram top to bottom; it's the path one audio chunk takes:
 
 ```mermaid
 flowchart TB
@@ -174,7 +174,16 @@ flowchart TB
     SDC -. "direct SHM chunk ring (bypass ZMQ)" .-> STAGE
 ```
 
-The load-bearing pieces: a **KV lease** (blocks not freed on segment finish, only on close), **duplex-append mode** (keep `num_computed_tokens`, extend the block table), an **adaptive coalescing window** (wait briefly so late chunks still batch), a **SHM direct-ingress ring** (skip the ZMQ round-trip), and **epoch barge-in** (every chunk carries `(session, turn, epoch)`; a barge-in bumps the epoch and stages drop stale work — never the KV).
+Each layer fixes one of the three problems from earlier:
+
+- **Protocol layer** — `WS /v1/audio/conversation`, an OpenAI-Realtime-aligned WebSocket carrying audio in *and* out on one long-lived connection. Deliberately thin: it just translates wire events into session calls and holds none of the hard logic.
+- **Engine layer** — where the call lives. The **`DuplexSession` registry** is the new home for "a conversation": it keys sessions by id, holds the barge-in **epoch** and the input **ring buffer**, and reclaims idle sessions by TTL *(problem ③ — the engine finally has a notion of a conversation)*. The **`StageDuplexClient`** is the thin handle a model drives it through — `open / push_chunk / signal_turn / barge_in / close`.
+- **Scheduler layer** — `OmniDuplexScheduler` does the two things the stock scheduler can't: it **holds the KV lease** so a session's blocks aren't freed between turns *(problem ① — no re-prefill)*, and runs the **coalescing window**, waiting a few ms so a momentarily-quiet stream still batches with its peers *(problem ② — no batch drop-out)*.
+- **Stage layer** — the model itself. **`DUPLEX_VAD`** owns turn-taking — *is the user's turn over? is this a barge-in?* — and gates the **`LLM_AR`** stage, which runs in **duplex-append mode**: it *adds* the new chunk's tokens to the kept KV instead of re-prefilling.
+
+The **dotted line is the latency shortcut**: audio chunks don't crawl down the layers over ZMQ — the `StageDuplexClient` writes them **straight into the stage-0 process through a shared-memory ring**, so only small control events (turn signals, barge-in) take the slow path. And every output chunk is stamped `(session, turn, epoch)`; a barge-in just bumps the epoch and stale chunks get dropped — but the KV lease is never touched.
+
+A model plugs in at exactly one seam — the `StageDuplexClient`:
 
 <details><summary>Code — the stage interface a model plugs into (RFC #3745)</summary>
 
