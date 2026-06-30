@@ -18,13 +18,34 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;700&family=Kalam:wght@400;700&display=swap" rel="stylesheet">
 <style>
-  .post .mermaid { text-align: center; margin: 2em 0; line-height: normal; }
-  .post .mermaid svg { max-width: 100%; height: auto; }
-  .post .mermaid .cluster-label, .post .mermaid .nodeLabel, .post .mermaid .edgeLabel {
-    font-family: "Kalam", ui-sans-serif, system-ui, sans-serif;
+  /* ---- presentation: monospace, black-on-white, minimal (aleksagordic.com feel) ---- */
+  main.blogPost { background: #fff; }
+  main.blogPost, main.blogPost .post {
+    font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+    color: #16181d;
   }
+  main.blogPost > div { max-width: 980px; }
+  main.blogPost header h1 { font-size: 2.4rem !important; line-height: 1.2; letter-spacing: -0.01em; color: #0a0a0a; }
+  main.blogPost nav, main.blogPost header > div { font-size: 0.88rem; color: #6b7280; }
+  main.blogPost .post { font-size: 17px; line-height: 1.75; }
+  main.blogPost .post h2 { font-size: 1.5rem; font-weight: 700; margin-top: 2.2em; letter-spacing: -0.01em; }
+  main.blogPost .post h3 { font-size: 1.12rem; font-weight: 700; }
+  main.blogPost .post a { color: #1d6f42; text-decoration: underline; text-underline-offset: 2px; }
+  main.blogPost .post code { font-family: "Geist Mono", ui-monospace, monospace !important; font-size: 0.9em; background: #f4f4f5; padding: 0.05em 0.32em; border-radius: 3px; }
+  main.blogPost .post table { font-size: 0.9em; }
+  main.blogPost .post figure figcaption, main.blogPost .post .table-caption { font-size: 0.84rem; color: #6b7280; }
+  main.blogPost .post details summary { color: #6b7280; cursor: pointer; }
+
+  /* ---- excalidraw-style graphs (anatomy-of-vLLM feel) ---- */
+  main.blogPost .post .mermaid { text-align: center; margin: 2.2em 0; line-height: normal; }
+  main.blogPost .post .mermaid svg { max-width: 100%; height: auto; }
+  main.blogPost .post .mermaid .cluster-label, main.blogPost .post .mermaid .nodeLabel, main.blogPost .post .mermaid .edgeLabel {
+    font-family: "Kalam", "Comic Sans MS", cursive !important; font-size: 15px;
+  }
+  main.blogPost .post .mermaid .cluster rect { fill: #fff !important; stroke: #94a3b8 !important; stroke-dasharray: 6 4 !important; }
+  main.blogPost .post .mermaid .edgeLabel { background: #fff; }
 </style>
 {{ end("helmet") }}
 
@@ -82,14 +103,15 @@
     theme: "base",
     fontFamily: "'Kalam', ui-sans-serif, system-ui, sans-serif",
     themeVariables: {
-      primaryColor: "#eef2ff",
-      primaryBorderColor: "#6366f1",
-      primaryTextColor: "#1f2937",
-      lineColor: "#6b7280",
-      secondaryColor: "#fef3c7",
-      tertiaryColor: "#ecfdf5",
+      primaryColor: "#ffe3dd",        // salmon node fill (anatomy pink)
+      primaryBorderColor: "#e07a5f",  // terracotta border
+      primaryTextColor: "#16181d",
+      lineColor: "#2b2b2b",           // near-black hand-drawn arrows
+      secondaryColor: "#d8f3dc",      // mint
+      tertiaryColor: "#cfe8ff",       // sky
+      fontSize: "15px",
     },
-    flowchart: { curve: "basis", htmlLabels: true, padding: 14 },
+    flowchart: { curve: "basis", htmlLabels: true, padding: 16 },
   });
   mermaid.run();
 </script>

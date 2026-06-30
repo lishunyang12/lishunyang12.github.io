@@ -9,6 +9,24 @@ Full-duplex voice is the "Doubao / Gemini Live / GPT-4o voice" experience: no pu
 
 They are the speech edge of a broader shift that Thinking Machines Lab calls [**interaction models**](https://thinkingmachines.ai/blog/interaction-models/): a model in "constant two-way exchange with the user — perceiving and responding at the same time," where "for interactivity to scale with intelligence, it must be part of the model itself." But if interactivity becomes native to the *model*, the *serving stack* has to match it — and a request-oriented engine can't. That gap is what this post is about.
 
+<figure>
+<img src="/images/minicpmo/x5.png" alt="turn-based vs full-duplex interaction">
+<figcaption>Figure 1. The shift, in the MiniCPM-o 4.5 paper's own terms (<a href="https://arxiv.org/abs/2604.27393">arXiv:2604.27393</a>, Fig. 3). Traditional streaming is <em>blocked</em>: the model perceives, <em>then</em> speaks. Full-duplex overlaps "AI perceives" and "AI speaks" on one timeline — it can react ("…OH! He SHOOTS!") while still watching.</figcaption>
+</figure>
+
+Whatever the modality, an interaction model runs **one loop**: perceive continuously, and every tick decide whether to stay silent, respond now, or hand the hard part to a slower background model. (MiniCPM-o 4.5 calls the first two `⟨listen⟩` / `⟨speak⟩`; JoyAI-VL, later in this post, adds the third — `delegate`.)
+
+```mermaid
+flowchart LR
+    p["PERCEIVE<br/>audio / video / text<br/>streaming in"] --> d{"every tick:<br/>what now?"}
+    d -- "nothing to add" --> sil["STAY SILENT<br/>keep watching"]
+    d -- "time to reply" --> resp["RESPOND<br/>speak / act now"]
+    d -- "too hard right now" --> del["DELEGATE<br/>hand to a background model"]
+    sil --> p
+    resp --> p
+    del --> p
+```
+
 vLLM-Omni cannot serve this today, and not because an adapter was written wrong. There is a **structural impedance mismatch**: the runtime is request-oriented (`prompt → output → done`, KV freed at finish), while the models are stream-oriented (continuous audio in *while* generating out, conversation-lifetime KV). Three model PRs (MiniCPM-o 4.5, `nemotron_duplex_h`, SoulX-Duplug) independently hit the **same wall**, each at risk of growing its own ad-hoc streaming path.
 
 [RFC #3745](https://github.com/vllm-project/vllm-omni/issues/3745) defines the duplex session primitive **once** and enumerates how each model conforms. This post walks through it: the substrate it builds on, the primitive itself, how the design review reshaped it across six model families, and how [PR #3907](https://github.com/vllm-project/vllm-omni/pull/3907) lands it for MiniCPM-o 4.5.
