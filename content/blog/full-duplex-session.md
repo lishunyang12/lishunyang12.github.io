@@ -39,7 +39,7 @@ flowchart TB
 
 ## What we mean by full-duplex
 
-Full-duplex voice is the "Doubao / Gemini Live / GPT-4o voice" experience: no push-to-talk, no turn button. You can interrupt the model mid-sentence, it listens and speaks at the same time, a single conversation context stays alive for minutes, and barge-in lands under 300–400 ms. A new class of models — MiniCPM-o 4.5 (Omni-Flow), Nemotron VoiceChat, SoulX-Duplug, Moshi, PersonaPlex on the audio side; JoyAI-VL on the vision side — are **full-duplex by design**: they perceive and respond *concurrently*.
+Full-duplex voice is the "Doubao / Gemini Live / GPT-4o voice" experience: no push-to-talk, no turn button. You can interrupt the model mid-sentence, it listens and speaks at the same time, a single conversation context stays alive for minutes, and barge-in lands under 300–400 ms. A new class of models — MiniCPM-o 4.5 (Omni-Flow — perception and speech on one time-sliced clock), Nemotron VoiceChat, SoulX-Duplug, Moshi, PersonaPlex on the audio side; JoyAI-VL on the vision side — are **full-duplex by design**: they perceive and respond *concurrently*.
 
 They are the edge of a broader shift Thinking Machines Lab calls [**interaction models**](https://thinkingmachines.ai/blog/interaction-models/): a model in "constant two-way exchange with the user — perceiving and responding at the same time," where "for interactivity to scale with intelligence, it must be part of the model itself." When interactivity becomes native to the *model*, the *serving stack* has to match it.
 
