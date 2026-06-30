@@ -130,6 +130,12 @@ Run a phone call through the counter and three things break:
 
 The one-line framing everyone shares: **the unit of work should be the session, not the request.**
 
+<div class="insight">
+
+The unit of work becomes the **session**, not the request. The KV cache is leased to the whole call — a barge-in drops the half-spoken reply but never the memory.
+
+</div>
+
 ## The proposed session primitive (RFC #3745)
 
 The RFC proposes one primitive — `DuplexSession` — and a loop that never says "done":
@@ -186,6 +192,12 @@ class StageDuplexClient(StagePoolClient, Protocol):
 ## One primitive, many model shapes
 
 The reason a shared primitive is worth the trouble: full-duplex models share almost nothing structurally *except* needing persistent KV. Two audio models from the thread look nothing alike.
+
+<div class="insight">
+
+Full-duplex models share almost **nothing** structurally — except needing persistent KV. That's the one thing worth building once, and the reason a shared session primitive exists at all.
+
+</div>
 
 <figure>
 <img src="/images/minicpmo/x6.png" alt="MiniCPM-o 4.5 Omni-Flow architecture">
@@ -253,6 +265,12 @@ flowchart LR
     a == "only this much enters memory" ==> mem[("conversation<br/>memory")]
     s -. "barge-in here: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
 ```
+
+<div class="insight">
+
+A barge-in tears down only the downstream stages and **keeps stage 0** — the one request that owns the conversation KV. "Drop the reply, keep the memory," literally in code. And **sent ≠ heard**: only *acknowledged* audio enters memory.
+
+</div>
 
 Net: #3907 **declares** the full capability surface (patterns, input modes, signal sources) but **defers** the scheduler-owned KV *lease* itself — today `supports_core_kv_lease` is a flag and stage 0 is simply kept resumable. Verified on H20: `stale_audio_delta_count=0` (barge-in really drops the stale stream).
 
@@ -376,6 +394,12 @@ flowchart LR
 
 `build_memory_prefix` stitches these into one text block — *video history* (long-term + mid-term) + *Q&A history* + the *standing query* — that rides in front of the frame. The subtle part is what it **withholds**: a *newly issued* query is **not** spliced into the head; it goes into the current tick's appended message instead. That keeps the head byte-identical across ticks, so vLLM's radix prefix cache hits and the growing history is never re-prefilled — Track B's entire KV-reuse strategy in one rule.
 
+<div class="insight">
+
+**Withhold the new query from the byte-stable head.** The prefix stays identical across ticks → vLLM's radix prefix cache hits → the hours-long history is never re-prefilled. That single rule *is* Track B's KV-reuse strategy.
+
+</div>
+
 <details><summary>Code — assembling the context prefix (joyvl/memory/memory.py)</summary>
 
 ```python
@@ -453,6 +477,12 @@ from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionS
 # yet #3907 built its own and never used it:
 from vllm_omni.experimental.fullduplex.core import DuplexSession   # demonstration / tests only
 ```
+
+<div class="insight">
+
+`core/` was built "for fused-audio models like MiniCPM-o" — and **MiniCPM-o built its own instead.** The fragmentation RFC #3745 set out to prevent has already happened.
+
+</div>
 
 - **①** converge into one model-agnostic core · keep two (native-audio vs orchestration-vision) · one shared API with two backends.
 - **②** treat native (#3907) and orchestration (#4575) as two backends of one core, chosen by latency tier · native as the destination, orchestration the day-0 stopgap · two independent tracks.
