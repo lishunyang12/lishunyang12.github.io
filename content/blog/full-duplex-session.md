@@ -9,6 +9,34 @@ This is a **map, not a verdict**. Full-duplex interaction serving in vLLM-Omni i
 
 > **Short on time? Jump to [Part 3](#part-3).** The decision matrix there *is* the agenda — nine questions in three themes. Parts 1–2 are the shared context you need to argue them.
 
+<div class="tldr">
+
+**In one minute.** Interaction models (voice, vision) perceive and respond *at the same time* — and today's request-oriented engine can't serve them. Four things to hold onto:
+
+- **The unit of work becomes the session, not the request** — the KV cache is leased to the whole call, not one reply.
+- **Two implementations are landing from opposite ends** — MiniCPM-o 4.5 native *in* the engine (#3907); JoyAI-VL as orchestration *over* a plain server (#4575).
+- **They each built their own `DuplexSession`** — the repo already has *two*, neither importing the other.
+- **Nine decisions are open** (Part 3) — the agenda this post exists to frame.
+
+</div>
+
+<div class="toc">
+
+**Contents** — [Part 1 · the common ground](#part-1) · [Part 2 · two implementations](#part-2) · [Part 3 · the decisions](#part-3)
+
+</div>
+
+The shape of the whole post, before the details:
+
+```mermaid
+flowchart TB
+    sub["vLLM-Omni stage runtime<br/>request-oriented today"] --> prim["the session primitive<br/>RFC #3745 (proposed)"]
+    prim --> A["Track A — native in-engine<br/>MiniCPM-o 4.5 · #3907"]
+    prim --> B["Track B — orchestration<br/>JoyAI-VL · #4575"]
+    A --> dec["nine open decisions<br/>Part 3 · the agenda"]
+    B --> dec
+```
+
 ## What we mean by full-duplex
 
 Full-duplex voice is the "Doubao / Gemini Live / GPT-4o voice" experience: no push-to-talk, no turn button. You can interrupt the model mid-sentence, it listens and speaks at the same time, a single conversation context stays alive for minutes, and barge-in lands under 300–400 ms. A new class of models — MiniCPM-o 4.5 (Omni-Flow), Nemotron VoiceChat, SoulX-Duplug, Moshi, PersonaPlex on the audio side; JoyAI-VL on the vision side — are **full-duplex by design**: they perceive and respond *concurrently*.
@@ -36,6 +64,8 @@ flowchart LR
 MiniCPM-o 4.5 calls the first two `⟨listen⟩` / `⟨speak⟩`; JoyAI-VL adds the third, `delegate`. The rest of this post is about what it takes to *serve* that loop.
 
 ---
+
+<a id="part-1"></a>
 
 # Part 1 — The common ground
 
@@ -193,6 +223,8 @@ These different clocks set hard **barge-in latency floors** and force a duplex a
 
 ---
 
+<a id="part-2"></a>
+
 # Part 2 — Two implementations, two directions
 
 Two PRs are landing full-duplex from opposite ends of the spectrum. This part describes both, neutrally; the question of how they relate is in Part 3.
@@ -211,23 +243,27 @@ flowchart LR
     s0 -. "listen: stay silent,<br/>keep the memory" .-> sess
 ```
 
+Two beats carry the whole design. First, **barge-in keeps the memory**: `barge_in()` bumps the epoch and tears down only `stage_id > 0`, **preserving stage 0** — the resumable request that owns the conversation KV. "Drop the reply, keep the memory," literally in code. Second, a **playback cursor** commits to memory only what was actually *heard*, not what was streamed:
+
+```mermaid
+flowchart LR
+    g["GENERATED<br/>model produced it"] --> s["SENT<br/>streamed to client"] --> a["ACKNOWLEDGED<br/>you actually heard it"]
+    a == "only this much enters memory" ==> mem[("conversation<br/>memory")]
+    s -. "barge-in here: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
+```
+
+Net: #3907 **declares** the full capability surface (patterns, input modes, signal sources) but **defers** the scheduler-owned KV *lease* itself — today `supports_core_kv_lease` is a flag and stage 0 is simply kept resumable. Verified on H20: `stale_audio_delta_count=0` (barge-in really drops the stale stream).
+
+<details><summary>Deep dive — Track A internals: the file walk, the session object, the code</summary>
+
 **The path a chunk takes.** The PR is ~27k lines, but the duplex flow is a straight line through four files:
 
 - `entrypoints/openai/serving_duplex.py` — the WebSocket handler: parse a frame, drive the session, emit `response.audio.delta`.
-- `engine/duplex.py` — the session state + manager (below); routes the append through the duplex data plane, not a fake chat request.
+- `engine/duplex.py` — the session state + manager; routes the append through the duplex data plane, not a fake chat request.
 - `models/minicpmo_4_5/duplex_runtime.py` + `duplex_policy.py` — Stage 0: MiniCPM's listen/speak decode, via the `worker/native_duplex.py` hooks.
-- `minicpmo_4_5_omni_tts.py` — Stage 1: on `speak`, Stage 0's hidden states hand off to TTS / token2wav, which streams audio back.
+- `minicpmo_4_5_omni_tts.py` — Stage 1: on `speak`, Stage 0's hidden states hand off to TTS / token2wav.
 
-### The session object — `DuplexSessionRuntimeState`
-
-One per call (held by `DuplexSessionRuntimeManager`). It owns four things:
-
-- **one long-lived resumable request per stage** — `bind_stage_request(stage_id, request_id)`; stage 0's binding carries `lease_active = capabilities.supports_core_kv_lease`.
-- **a declared capability surface** — `append_input(payload, mode=…)` *rejects* any `DuplexInputMode` the model didn't declare.
-- **the playback cursor** — `acknowledge_playback(played_ms, committed_ms)`.
-- **the barge-in rule** — `barge_in()` bumps the epoch and tears down only `stage_id > 0`, **preserving stage 0** (the request that owns the conversation KV). This is the "keep the memory" arrow above, made literal:
-
-<details><summary>Code — barge-in preserves stage 0 (engine/duplex.py)</summary>
+**The session object — `DuplexSessionRuntimeState`** (one per call, held by `DuplexSessionRuntimeManager`) owns four things: one long-lived resumable request per stage (`bind_stage_request`); a declared capability surface (`append_input` rejects any undeclared `DuplexInputMode`); the playback cursor (`acknowledge_playback`); and the barge-in rule:
 
 ```python
 def barge_in(self) -> tuple[int, list[str]]:
@@ -241,52 +277,30 @@ def barge_in(self) -> tuple[int, list[str]]:
     return self.epoch, stale
 ```
 
-</details>
-
 The capability surface is the heart of the design — a model declares its shape, the runtime adapts:
 
-<details><summary>Code — the capability enums (engine/duplex.py)</summary>
-
 ```python
-class SessionMode(str, Enum):
-    TURN = "turn"
-    DUPLEX = "duplex"
-
 class DuplexAdapterPattern(str, Enum):
     CHUNK_GROUP_APPEND = "chunk_group_append"          # MiniCPM-o 4.5
     PER_STEP_TENSOR_INJECT = "per_step_tensor_inject"  # Nemotron VoiceChat
     PARALLEL_FRAME_JOINT = "parallel_frame_joint"      # Moshi-class
-    # … + 4 handoff / data-plane variants
 
-class DuplexInputMode(str, Enum):
+class DuplexInputMode(str, Enum):                      # append is one mode among several (decision ⑤)
     APPEND_AUDIO_CHUNK = "append_audio_chunk"
     REPLACE_LATEST_CHUNK = "replace_latest_chunk"
     REENCODE_CONTEXT = "reencode_context"
     ROLLBACK_TO_CHECKPOINT = "rollback_to_checkpoint"
-    TURN_COMMIT_ONLY = "turn_commit_only"              # append is one mode among several (decision ⑤)
+    TURN_COMMIT_ONLY = "turn_commit_only"
 
-class DuplexSignalSource(str, Enum):
-    MODEL_NATIVE = "model_native"                      # the model self-VADs
+class DuplexSignalSource(str, Enum):                   # turn-taking from many sources (decision ③)
+    MODEL_NATIVE = "model_native"
     EXTERNAL_VAD = "external_vad"
     CLIENT_EVENT = "client_event"
-    SERVER_POLICY = "server_policy"                    # turn-taking from many sources (decision ③)
+    SERVER_POLICY = "server_policy"
     DIALOGUE_STATE_MODEL = "dialogue_state_model"
 ```
 
-</details>
-
-### The playback cursor — four watermarks
-
-`DuplexPlaybackCommitCursor` keeps four monotonic millisecond marks — `generated → sent → played → committed` — and **only `committed` enters memory**. A barge-in between `sent` and `played` discards audio the user never heard.
-
-```mermaid
-flowchart LR
-    g["GENERATED<br/>model produced it"] --> s["SENT<br/>streamed to client"] --> a["ACKNOWLEDGED<br/>you actually heard it"]
-    a == "only this much enters memory" ==> mem[("conversation<br/>memory")]
-    s -. "barge-in here: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
-```
-
-<details><summary>Code — the four watermarks (engine/duplex.py)</summary>
+**The playback cursor — four watermarks.** `DuplexPlaybackCommitCursor` keeps `generated → sent → played → committed`; only `committed` enters memory:
 
 ```python
 def mark_generated(self, generated_ms): self.generated_ms = max(self.generated_ms, generated_ms)
@@ -297,12 +311,6 @@ def acknowledge(self, played_ms, committed_ms=None):
 ```
 
 </details>
-
-### Declares vs. defers
-
-- **Declares** the full capability surface above — patterns, input modes, signal sources, `supports_core_kv_lease`.
-- **Defers** the scheduler-owned KV *lease* itself (allocation / rollback / migration / release): today `supports_core_kv_lease` is a flag, and stage 0 is simply kept resumable.
-- **Verified** on H20: `overlap_listen=true` · `playback_commit_ok=true` · `stale_audio_delta_count=0` (barge-in drops the stale stream).
 
 ## Track B — vision, orchestration over a plain server (JoyAI-VL, #4575)
 
