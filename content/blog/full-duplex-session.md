@@ -33,67 +33,60 @@ This substrate is strong — up to 91.4% lower job-completion time versus baseli
 
 ## The impedance mismatch
 
+The simplest way to feel the mismatch: today's engine treats a conversation like **ordering at a counter**, but full-duplex needs it to behave like **a phone call**.
+
 ```mermaid
 flowchart LR
-    subgraph REQ["vLLM-Omni today — request-oriented"]
-        A1[add_request] --> A2[prefill prompt] --> A3[decode loop] --> A4[finish]
-        A4 --> A5["free_request → free_blocks<br/>KV returned to manager"]
+    subgraph R["A REQUEST — like ordering at a counter"]
+        direction TB
+        r1["you give your<br/>whole order"] --> r2["they make it"] --> r3["they hand<br/>it over"] --> r4["done — and<br/>they forget you"]
     end
-    subgraph DUP["Duplex models — stream-oriented"]
-        B1[open session] --> B2[continuous chunks in]
-        B2 --> B3[generate out concurrently] --> B2
-        B2 --> B4[barge-in / turn change] --> B3
-        B3 --> B5["close session<br/>minutes later"]
+    subgraph S["A SESSION — like a phone call"]
+        direction TB
+        s1["the call opens"] --> s2["both talk at once,<br/>for minutes"]
+        s2 --> s3["you can cut in<br/>any time"] --> s2
+        s2 --> s4["the call hangs up"]
     end
 ```
 
-RFC #3745 grounds the wall in six concrete blockers in the current code:
+The engine was built for the counter. Run a phone call through it and three things break — and that's the whole story:
 
-<div class="table-caption">Table 1. Six places the request-oriented runtime blocks full-duplex (RFC #3745).</div>
+<div class="table-caption">Table 1. What breaks, in plain terms.</div>
 <table>
-<thead><tr><th>#</th><th>Where</th><th>Current behavior</th><th>Why it blocks duplex</th></tr></thead>
+<thead><tr><th>What breaks</th><th>What full-duplex needs instead</th></tr></thead>
 <tbody>
-<tr><td>1</td><td><code>OmniARScheduler._free_request / _free_blocks</code></td><td>KV blocks returned to the manager on request finish</td><td>No conversation-lifetime KV — every turn re-prefills</td></tr>
-<tr><td>2</td><td><code>_replace_session_with_streaming_update</code></td><td>Sets <code>num_computed_tokens = 0</code>, clears token buffers</td><td>The existing "streaming" path re-prefills each segment</td></tr>
-<tr><td>3</td><td><code>process_pending_full_payload_inputs</code></td><td>A request without a ready next chunk is pulled from the queue, re-inserted later</td><td>A late chunk drops out of the GPU batch → under-batching (~½ throughput, 2× ITL)</td></tr>
-<tr><td>4</td><td><code>Orchestrator._route_output</code></td><td>Assumes requests have a begin/end; finalizes on finish</td><td>No persistent session owning long-lived per-stage requests</td></tr>
-<tr><td>5</td><td>Per-token <code>core → client → core</code> over ZMQ</td><td>The next audio chunk round-trips through the orchestrator client</td><td>+3–5 ms/token, growing under concurrency</td></tr>
-<tr><td>6</td><td><code>StageExecutionType</code> enum</td><td>Only <code>LLM_AR / LLM_GENERATION / DIFFUSION</code></td><td>No stage type owns turn-taking</td></tr>
+<tr><td>The model <strong>forgets everything</strong> the instant it finishes a reply</td><td>Keep the conversation's memory (its KV cache) alive for the <em>whole call</em></td></tr>
+<tr><td>Go quiet for a moment and the engine <strong>drops you from the batch</strong> — so the next words re-compute from scratch</td><td>Hold your seat through the silences, so work still batches efficiently</td></tr>
+<tr><td>The engine has <strong>no idea what "a conversation" or "whose turn it is"</strong> even means</td><td>A <em>session</em> that owns turn-taking — and lets you interrupt mid-reply</td></tr>
 </tbody>
 </table>
+
+<details><summary>For the curious: the six exact code sites RFC #3745 names</summary>
+
+`_free_blocks` returns KV on finish; the streaming path resets `num_computed_tokens = 0` and re-prefills; a late chunk is pulled from the waiting queue (under-batching, ~½ throughput); `Orchestrator._route_output` finalizes on finish; the per-token audio chunk round-trips `core → client → core` over ZMQ (+3–5 ms/token); and `StageExecutionType` has no member that owns turn-taking. The three plain-language problems above are exactly these six, grouped.
+
+</details>
 
 The thesis in one line: **the unit of work is the session, not the request.** The Thinker's KV is leased to the session and survives every turn; barge-in flushes downstream stages and bumps an epoch but never frees the conversation KV.
 
 ## The session primitive (RFC #3745)
 
-The target experience is a loop that never says "done":
+The target experience is a loop that never says "done" — listen, decide whose turn it is, speak, and let the user cut in at any moment:
 
 ```mermaid
-sequenceDiagram
-    participant U as User (mic)
-    participant S as DuplexSession (orchestrator)
-    participant DV as duplex_vad
-    participant TH as Thinker (session-pinned KV)
-    participant TK as Talker / Token2Wav
-    U->>S: open_session — KV lease acquired
-    loop continuous, never "done"
-        U-->>S: PCM chunk (80–160 ms)
-        S->>DV: chunk → turn state
-        alt user_complete
-            S->>TH: gate open — append chunk (KV kept)
-            TH-->>U: text delta
-            TH->>TK: hidden states (async chunk)
-            TK-->>U: audio
-        else user speaks while model speaking
-            U-->>S: PCM (barge-in)
-            S->>TK: epoch++ — flush stale, abort talker
-            S->>TH: keep KV, resume listening
-        end
-    end
-    U->>S: close — KV lease released
+flowchart TB
+    open(["call opens — the conversation gets its own memory (a KV lease)"]) --> listen
+    listen["LISTEN — audio streams in; the model watches for your turn to end"] --> turn{"whose turn?"}
+    turn -- "you're still talking, or you cut in" --> barge["BARGE-IN — stop speaking, drop the half-said reply, but KEEP the memory"]
+    barge --> listen
+    turn -- "you finished" --> speak["SPEAK — think, then stream audio back; memory carried across the turn"]
+    speak --> listen
+    listen -. "you hang up" .-> close(["call ends — memory released"])
 ```
 
-The RFC lays this out as four layers. The key pieces:
+The one idea that makes this work: **the memory (KV cache) is leased to the call, not to a single reply.** A barge-in throws away the half-spoken answer but never the memory — so the model still remembers the whole conversation on the next turn.
+
+Under the hood the RFC organizes it as four thin layers. The key pieces:
 
 ```mermaid
 flowchart TB
@@ -128,44 +121,27 @@ The reason this is worth doing *once* is that full-duplex models share almost no
 
 **MiniCPM-o 4.5 (Omni-Flow): 1-second chunk groups.** A structured token group is appended once per chunk period; output is variable-length, terminated by a learned `⟨chunk_eos⟩`; the model self-VADs with `⟨listen⟩` / `⟨speak⟩`, so barge-in is only possible at chunk boundaries.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as User
-    participant LM as Omni LM (session KV)
-    participant T2W as Flow-Matching Decoder
-    Note over LM: t=0..1s, user mid-sentence
-    U->>LM: append [chunk_bos v0 a0]
-    LM-->>U: listen / chunk_eos
-    Note over LM: t=1..2s, user done, model speaks
-    U->>LM: append [chunk_bos v1 a1]
-    LM-->>T2W: speak / tts_bos t1 s1 ... tts_eos / chunk_eos
-    T2W-->>U: audio frames
-    Note over LM: t=2..3s, user barges in
-    U->>LM: append [chunk_bos v2 a2]
-    LM-->>U: listen / chunk_eos
-    Note over T2W,U: in-flight audio plays out <= 1 s
-```
+**Nemotron VoiceChat: every decode step.** No chunks, no boundary tokens. One acoustic embedding (a continuous tensor, not a token) is added every decode tick; one word-token + one "what I just heard" token come out per tick; the TTS stage speaks one step behind. There is no learned `⟨listen⟩` / `⟨speak⟩` — "silent" is just text-EOS reused — so barge-in is *not* something the model does; the engine has to enforce it.
 
-**Nemotron VoiceChat: per-decode-step embedding fusion.** No chunks, no boundary tokens. One acoustic embedding (a continuous tensor, not a token) is added at the input embedding every decode tick; one text token + one ASR token come out per tick; EarTTS runs lag-by-one as a separate stage. There is no learned `⟨listen⟩`/`⟨speak⟩` — "silent" is text EOS reused — so barge-in is *not* a model affordance and must be enforced engine-side.
+The two run on completely different clocks — and that difference is the whole reason one adapter has to flex:
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant U as User
-    participant ENC as Acoustic Encoder
-    participant LM as NemotronDuplexH (session KV)
-    participant TTS as EarTTS (separate stage)
-    Note over LM: each decode tick (~25..40 ms)
-    U->>ENC: PCM frame
-    ENC->>LM: acoustic_embedding_t (continuous tensor)
-    LM-->>LM: text_token_t (LM head)
-    LM-->>LM: asr_token_t (parallel ASR head)
-    LM->>TTS: text_token_t
-    TTS-->>U: speech_code (lag-by-1)
+flowchart LR
+    subgraph M["MiniCPM-o 4.5 — a 1-second clock"]
+        direction TB
+        m1["every 1 s:<br/>append an audio chunk"] --> m2{"listen<br/>or speak?"}
+        m2 -- speak --> m3["stream ~1 s<br/>of audio back"]
+        m2 -- listen --> m1
+        m3 -. "you can only cut in at<br/>the next chunk edge (≈1 s)" .-> m1
+    end
+    subgraph N["Nemotron VoiceChat — a 30 ms clock"]
+        direction TB
+        n1["every ~30 ms:<br/>one audio frame in"] --> n2["one word out +<br/>one 'what I heard' out"] --> n3["TTS speaks,<br/>one step behind"]
+        n3 -. "you can cut in any tick —<br/>but the engine must enforce it" .-> n1
+    end
 ```
 
-These two architectures, plus the future Moshi-class joint predictor, set hard **latency floors** and force the adapter to support **three injection patterns** rather than one:
+These two clocks, plus a future Moshi-class joint predictor, set hard **latency floors** and force the adapter to support **three injection patterns** rather than one:
 
 <div class="table-caption">Table 2. Barge-in latency floors (per the RFC discussion).</div>
 <table>

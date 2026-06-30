@@ -65,7 +65,21 @@
     div.textContent = code.textContent;
     code.parentElement.replaceWith(div);
   });
-  mermaid.initialize({ startOnLoad: false, theme: "neutral" });
+  mermaid.initialize({
+    startOnLoad: false,
+    look: "handDrawn",          // excalidraw-style rough rendering
+    theme: "base",
+    fontFamily: "ui-sans-serif, system-ui, sans-serif",
+    themeVariables: {
+      primaryColor: "#eef2ff",
+      primaryBorderColor: "#6366f1",
+      primaryTextColor: "#1f2937",
+      lineColor: "#6b7280",
+      secondaryColor: "#fef3c7",
+      tertiaryColor: "#ecfdf5",
+    },
+    flowchart: { curve: "basis", htmlLabels: true, padding: 14 },
+  });
   mermaid.run();
 </script>
 {{ end("children") }}
