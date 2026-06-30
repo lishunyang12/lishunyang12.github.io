@@ -47,6 +47,7 @@ flowchart LR
         s2 --> s3["you can cut in<br/>any time"] --> s2
         s2 --> s4["the call hangs up"]
     end
+    R ~~~ S
 ```
 
 The engine was built for the counter. Run a phone call through it and three things break — and that's the whole story:
@@ -176,7 +177,17 @@ The thread (8+ contributors, six model families) tightened the RFC in a few deci
 
 ## Realizing it: MiniCPM-o 4.5 native duplex (PR #3907)
 
-PR #3907 is the first native landing — and, notably, it implements the *refined* RFC, not the first draft. It extends MiniCPM-o 4.5 from staged serving into a session-oriented audio stream over two endpoints, `/v1/duplex` (native) and `/v1/realtime?duplex=1` (an OpenAI-Realtime adapter), driving a real `audio-in → Stage0 listen/speak → Stage0→Stage1 handoff → Stage1 TTS/token2wav → audio-out` loop.
+PR #3907 is the first native landing — and, notably, it implements the *refined* RFC, not the first draft. It extends MiniCPM-o 4.5 from staged serving into a session-oriented audio stream over two endpoints, `/v1/duplex` (native) and `/v1/realtime?duplex=1` (an OpenAI-Realtime adapter). The data plane is a real audio-in → audio-out loop:
+
+```mermaid
+flowchart LR
+    mic["your voice<br/>(PCM frames in)"] --> ep{"/v1/duplex or<br/>/v1/realtime?duplex=1"}
+    ep --> sess["session actor<br/>(epoch + playback cursor)"]
+    sess --> s0["Stage 0<br/>listen / speak decode"]
+    s0 -- "speak: hand off hidden states" --> s1["Stage 1<br/>TTS / token2wav"]
+    s1 --> out["audio streamed back"]
+    s0 -. "listen: stay silent,<br/>keep the memory" .-> sess
+```
 
 The ~27k-line PR maps cleanly onto the RFC's layers:
 
@@ -208,6 +219,15 @@ The most striking part is `engine/duplex.py`: its type system reads like a check
 </table>
 
 MiniCPM is the **chunk-group append** pattern from Table 3, and the commit log is where the Omni-Flow specifics live: pacing bridge results to "the official 1-s-per-result rhythm," padding "the turn-end vocoder flush to one fixed window shape," slicing "past the leading listen run" so the **playback cursor survives turn close**, and keeping an "audio+transcript delta pair for text-less units." These are exactly the 1-second-chunk, `⟨chunk_eos⟩`, and playback-cursor details the design predicted.
+
+That playback cursor is the prettiest small idea in the PR — it's how the model only remembers what you *actually heard*, not what it streamed. A barge-in cuts the line between "sent" and "heard":
+
+```mermaid
+flowchart LR
+    g["GENERATED<br/>model produced it"] --> s["SENT<br/>streamed to client"] --> a["ACKNOWLEDGED<br/>you actually heard it"]
+    a == "only this much enters memory" ==> mem[("conversation<br/>memory")]
+    s -. "barge-in here: drop the rest —<br/>it was sent but never heard" .-> x(["discarded"])
+```
 
 What #3907 **honestly defers** is the one piece the RFC calls its deepest: the **persistent core KV lease** — `resumable`/session state here is *not* the full scheduler-owned lease (allocation, rollback, migration, release), nor one-long-lived-request-per-stage or byte-perfect Realtime. In RFC terms it nails the **control semantics** (Phase 0–3 territory) and leaves the Phase-1 KV lease for a follow-up. The H20 end-to-end run is the receipt: `overlap_listen=true`, `overlap_barge_in=true`, `playback_commit_ok=true`, and crucially `stale_audio_delta_count=0` — barge-in actually drops the stale stream.
 

@@ -15,6 +15,17 @@
 <meta name="twitter:title" content="{{ $self.title }}">
 <meta name="twitter:description" content="{{ $self.description }}">
 <meta name="twitter:url" content="https://lishunyang12.github.io{{ $self.slug }}">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  .post .mermaid { text-align: center; margin: 2em 0; line-height: normal; }
+  .post .mermaid svg { max-width: 100%; height: auto; }
+  .post .mermaid .cluster-label, .post .mermaid .nodeLabel, .post .mermaid .edgeLabel {
+    font-family: "Kalam", ui-sans-serif, system-ui, sans-serif;
+  }
+</style>
 {{ end("helmet") }}
 
 {{ begin("children") }}
@@ -69,7 +80,7 @@
     startOnLoad: false,
     look: "handDrawn",          // excalidraw-style rough rendering
     theme: "base",
-    fontFamily: "ui-sans-serif, system-ui, sans-serif",
+    fontFamily: "'Kalam', ui-sans-serif, system-ui, sans-serif",
     themeVariables: {
       primaryColor: "#eef2ff",
       primaryBorderColor: "#6366f1",
