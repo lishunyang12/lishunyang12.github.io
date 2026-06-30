@@ -159,11 +159,11 @@ flowchart TB
         WS["WS /v1/audio/conversation"]
     end
     subgraph ENG["Engine layer"]
-        DS["DuplexSession registry<br/>TTL-GC, epoch, ring buffer"]
-        SDC["StageDuplexClient<br/>open / push_chunk / signal_turn / barge_in / close"]
+        DS["DuplexSession registry<br/>TTL-GC · epoch · ring buffer"]
+        SDC["StageDuplexClient<br/>open · push_chunk · signal_turn<br/>barge_in · close"]
     end
     subgraph SCHED["Scheduler layer"]
-        DSCH["OmniDuplexScheduler<br/>session KV lease + coalescing window"]
+        DSCH["OmniDuplexScheduler<br/>session KV lease<br/>+ coalescing window"]
     end
     subgraph STAGE["Stage layer"]
         DV["DUPLEX_VAD — turn-taking"]
