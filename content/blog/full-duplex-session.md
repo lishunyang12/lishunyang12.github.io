@@ -266,22 +266,40 @@ flowchart LR
     s0 -. "listen: stay silent,<br/>keep the memory" .-> sess
 ```
 
-Two beats carry the whole design. First, **barge-in keeps the memory**: `barge_in()` bumps the epoch and tears down only `stage_id > 0`, **preserving stage 0** — the resumable request that owns the conversation KV. "Drop the reply, keep the memory," literally in code. Second, a **playback cursor** commits to memory only what was actually *heard*, not what was streamed:
+**The whole session is three monotonic quantities.** Everything Track A does — listen, speak, remember, get interrupted — is governed by three counters that *only ever move up*. Read one full session as their joint timeline (the user speaks, the model replies, the user barges in, the model replies again):
+
+<table>
+<tr><th>tick →</th><th>t₀ open</th><th>t₁ listen +5s</th><th>t₂ model speaks</th><th>t₃ <strong>BARGE-IN</strong></th><th>t₄ listen +3s</th><th>t₅ speaks again</th></tr>
+<tr><td><strong>① epoch</strong> <em>(generation)</em></td><td>0</td><td>0</td><td>0</td><td><strong>↑ 1</strong></td><td>1</td><td>1</td></tr>
+<tr><td><strong>② committed → memory</strong> <em>(ms actually heard)</em></td><td>0</td><td>0</td><td>… streaming …</td><td><strong>600</strong></td><td>600</td><td>600 → 1400</td></tr>
+<tr><td><strong>③ stage-0 KV</strong> <em>(tokens, never freed)</em></td><td>0</td><td>60</td><td>72</td><td>72</td><td>108</td><td>120</td></tr>
+</table>
+
+The table *is* the design. Every column is boring except the **barge-in** column — and even there, watch what does **not** fall: the KV (③) and the committed memory (②) keep climbing. Barge-in ticks the epoch and tears down the downstream stages, but stage 0's KV and the conversation memory survive untouched. "Drop the reply, keep the memory," literally as a graph. Now the three, one at a time:
+
+**① epoch — the generation counter.** `begin_response` stamps a reply with the current epoch; every emitted chunk checks `is_stale(epoch)`; `barge_in()` does `epoch++`. That one increment invalidates *every* in-flight piece of the old reply at once — nobody chases scattered chunks, they self-drop the next time they look. It is an **integer, not a bool**: after two barge-ins you must distinguish live-generation 2 from dead-1 from dead-0, which a flag could never encode. And it tears down only `stage_id > 0` — **stage 0, which owns the conversation KV, is deliberately exempt**:
 
 ```mermaid
 flowchart LR
-    g["GENERATED<br/>model produced it"] --> s["SENT<br/>streamed to client"] --> a["ACKNOWLEDGED<br/>you actually heard it"]
-    a == "only this much enters memory" ==> mem[("conversation<br/>memory")]
-    s -. "barge-in here: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
+    bi["barge-in"] --> ep["epoch++<br/>0 → 1"]
+    ep --> stale["stage_id > 0<br/>torn down"]
+    ep --> keep["stage 0 KV<br/>kept resident"]
+    stale --> drop(["in-flight reply<br/>self-drops (stale)"])
+    keep --> mem[("conversation<br/>memory survives")]
 ```
 
-<div class="insight">
+**② playback cursor — commit only what was *heard*.** Four watermarks, each `max`-monotone: `generated → sent → played → committed`. The model races ahead, the speaker lags, and **sent ≠ heard** — so on barge-in only `played_ms` enters memory; the streamed-but-unplayed tail is discarded. That is why the model never believes it said something you didn't actually hear:
 
-A barge-in tears down only the downstream stages and **keeps stage 0** — the one request that owns the conversation KV. "Drop the reply, keep the memory," literally in code. And **sent ≠ heard**: only *acknowledged* audio enters memory.
+```mermaid
+flowchart LR
+    g["GENERATED<br/>model produced it"] --> s["SENT<br/>streamed to client"] --> a["PLAYED<br/>you actually heard it"]
+    a == "only this much (played_ms) enters memory" ==> mem[("conversation<br/>memory")]
+    s -. "barge-in: drop the rest —<br/>sent but never heard" .-> x(["discarded"])
+```
 
-</div>
+**③ stage-0 KV — the memory itself, and the one that never comes back down.** A single long-lived resumable request owns the conversation KV. It grows at **~12 tokens/sec of audio** (1 s = 16000 samples @ 16 kHz → 10 pooled embeddings + `<unit>`/`</unit>`) and **nothing ever frees it** until the call closes — no compaction, no eviction, no sliding window. Barge-in *keeps* it; that is the entire point of preserving stage 0. The cost is that growth is linear and uncompacted, so the session's horizon is bounded: **context window ÷ 12 seconds** of conversation.
 
-Both beats live on one small state machine — the session moves between *listening* and *responding*, and barge-in is the edge that returns it without dropping the memory:
+All three ride one small state machine — the session moves between *listening* and *responding*, and barge-in is the edge that returns it without dropping the memory:
 
 ```mermaid
 stateDiagram-v2
@@ -291,14 +309,14 @@ stateDiagram-v2
     LISTENING --> RESPONDING: commit / response.create · begin_response (capture epoch)
     RESPONDING --> RESPONDING: input.append · listen WHILE speaking
     RESPONDING --> LISTENING: response.done (not stale)
-    RESPONDING --> LISTENING: barge-in · epoch++ → old reply goes stale, stage 0 KV kept
+    RESPONDING --> LISTENING: barge-in · epoch++ → old reply stale, stage 0 KV kept
     LISTENING --> CLOSED: close
     RESPONDING --> CLOSED: close
 ```
 
-Two edges make it *full-duplex* rather than turn-based. The **self-loop on `RESPONDING`** — `input.append` keeps feeding the model *while it speaks* — is the duplex property; a half-duplex machine has no such edge. And **barge-in is an epoch bump, not a state**: `begin_response` captures the epoch, every emitted chunk checks `is_stale(epoch)`, and a new response or a cancel just does `epoch++` — instantly invalidating the in-flight reply while stage 0's KV stays resident. So "interrupt me" isn't a transition you draw; it's a generation counter that ages out the old activity.
+Two edges make it *full-duplex* rather than turn-based. The **self-loop on `RESPONDING`** — `input.append` keeps feeding the model *while it speaks* — is the duplex property; a half-duplex machine has no such edge. And **barge-in is an epoch bump, not a state**: "interrupt me" isn't a transition you draw, it's the generation counter (①) ageing out the old activity while stage 0's KV (③) stays resident.
 
-Net: #3907 **declares** the full capability surface (patterns, input modes, signal sources) but **defers** the scheduler-owned KV *lease* itself — today `supports_core_kv_lease` is a flag and stage 0 is simply kept resumable. Verified on H20: `stale_audio_delta_count=0` (barge-in really drops the stale stream).
+Net: #3907 **declares** the full capability surface (patterns, input modes, signal sources), but the scheduler-owned KV **lease is a slot, not a mechanism** — `supports_core_kv_lease` defaults to `False` and `lease_active` is bookkeeping that nothing acts on. Stage 0's context is **model-internal state** (`supports_model_internal_state`), not a leased, migratable core KV. So the memory is resident but bounded: it can't migrate across replicas, and because it is never compacted it runs until `max_model_len` is exhausted (the model's `max_position_embeddings` × any `rope_scaling`, clamped by `--max-model-len`) — on the order of context-window ÷ 12 seconds of talk. Verified on H20: `stale_audio_delta_count=0` (barge-in really drops the stale stream). That bound is exactly the seam to Track B, which throws the resident KV away and rebuilds context from compact text every tick — trading MiniCPM's minutes-long, low-latency horizon for an unbounded one.
 
 <details><summary>Deep dive — Track A internals: the file walk, the session object, the code</summary>
 
