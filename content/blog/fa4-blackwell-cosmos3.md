@@ -13,7 +13,8 @@ Low-bit attention is the main speed lever left for long-video diffusion on datac
 
 - **Quality at the bf16 floor, no tricks**: same-seed SSIM vs cuDNN — t2v @189f **0.970**, i2v **0.963** (floor 0.968), t2v @33f **0.950** (floor 0.975), v2v **0.811 — identical to its bf16 floor (0.8115)** — from step 0, with no bf16-warmup schedule. Stock FP8 scores 0.73–0.87 on the same tests.
 - **Speed kept**: 1.24–1.25x over cuDNN kernel-level at Cosmos3 shapes, ~1.1x end-to-end at 189 frames. The Hadamard conditioning is free (fused into an already-compiled quantization block).
-- **Why it works**: an error decomposition on real activations showed FA4's FP8 kernel carries an ~11–16% *intrinsic* error on diffuse attention — P and V precision, not input scales. Fixing it required surgery inside the kernel: keep QKᵀ in fp8, run P·V in bf16. ~90 changed lines in FA4's dtype-parameterized CuTe-DSL, all no-ops for existing kernels.
+- **Why it works**: an error decomposition showed FA4's FP8 kernel carries an ~11–16% *intrinsic* error on diffuse attention. Building a mixed fp8-QKᵀ/bf16-P·V kernel (~90 lines inside FA4's CuTe-DSL) eliminated it — and the forensics that followed found the root cause: **a one-line bug**. FA4's pipelined softmax computes P̃ against a delayed running max, and with `max_offset=8` (P̃×256) e4m3 has only 1.75x headroom for the overshoot — wide-range logits (video DiTs, σ≥1) silently clip P. LLM-sharp attention never grows the max mid-sequence, so nobody saw it.
+- **The endgame**: with the fix (`max_offset` 8→4) plus Hadamard input conditioning, **full FP8 runs at its native 1.49x with floor-level quality** — i2v 0.965, t2v 0.951, matching the mixed kernel while beating its speed. The fix is a one-constant upstream patch.
 
 </div>
 
@@ -21,18 +22,18 @@ Low-bit attention is the main speed lever left for long-video diffusion on datac
 
 Same seed, official Cosmos3 configs (35 steps for t2v/i2v at 33 frames; 35 steps at 189 frames; v2v 50 steps / 121 frames conditioned on the official reference clip). SSIM against the cuDNN baseline; the bf16-FA4 column is the same-trajectory noise floor.
 
-| Task | stock FP8 | mixed kernel | **mixed + Hadamard** | bf16 floor |
+| Task | stock FP8 | mixed + Hadamard (1.24x) | **fixed FP8 + Hadamard (1.49x)** | bf16 floor |
 |---|---|---|---|---|
-| t2v · 33f | 0.872 | 0.910 | **0.950** | 0.975 |
-| i2v · 33f | 0.733 | 0.926 | **0.963** | 0.968 |
+| t2v · 33f | 0.872 | 0.950 | **0.951** | 0.975 |
+| i2v · 33f | 0.733 | 0.963 | **0.965** | 0.968 |
 | t2v · 189f (long video) | — | — | **0.970** | — |
 | v2v · 121f · 50 steps (reference-conditioned) | — | — | **0.8115** | 0.8115 |
 
-| Speed | cuDNN | FA4 bf16 | **mixed + Hadamard** | stock FP8 |
+| Speed | cuDNN | FA4 bf16 | mixed + Hadamard | **fixed FP8 + Hadamard** |
 |---|---|---|---|---|
-| kernel @21.5k tokens | 1.00x | 1.03x | **1.25x** | 1.49x |
-| kernel @86k tokens | 1.00x | 1.04x | **1.24x** | 1.49x |
-| e2e @189f t2v | 2.45–2.55 s/step | 2.36 | **~2.29 (~1.1x)** | 2.00 (1.28x) |
+| kernel @21.5k tokens | 1.00x | 1.03x | 1.25x | **1.49x** |
+| kernel @86k tokens | 1.00x | 1.04x | 1.24x | **1.49x** |
+| e2e @189f t2v | 2.45–2.55 s/step | 2.36 | ~2.29 (~1.1x) | **2.00 (1.28x)** |
 
 Attention error on real Cosmos3 activations (relative to the bf16 kernel): stock FP8 **0.237** → mixed **0.065** → mixed+Hadamard **0.032**. Zero Dynamo recompiles in the compiled pipeline; no `fp8_start_step` schedule anywhere — the quality comes from the kernel, not from giving back speed on early steps.
 
@@ -40,8 +41,8 @@ Attention error on real Cosmos3 activations (relative to the bf16 kernel): stock
 <div class="gal">
 <div><video src="/videos/fa4/i2v_cudnn.mp4" controls muted loop playsinline></video><div class="c">cuDNN (baseline)</div></div>
 <div><video src="/videos/fa4/i2v_fa4_fp8.mp4" controls muted loop playsinline></video><div class="c">stock FP8 · 0.733</div></div>
-<div><video src="/videos/fa4/i2v_fa4_mixed.mp4" controls muted loop playsinline></video><div class="c">mixed kernel · 0.926</div></div>
 <div><video src="/videos/fa4/i2v_fa4_mixed_had.mp4" controls muted loop playsinline></video><div class="c">mixed + Hadamard · 0.963</div></div>
+<div><video src="/videos/fa4/i2v_fa4_fp8fixed_had.mp4" controls muted loop playsinline></video><div class="c">fixed FP8 + Hadamard · 0.965</div></div>
 </div>
 <figcaption>Fig. 1 — i2v (the most quantization-sensitive short task), same seed, official config. bf16 floor: 0.968.</figcaption>
 </figure>
@@ -78,7 +79,9 @@ We started where everyone does: FA4's FP8 path with per-(batch, kv-head) e4m3 sc
 | **Real FP8 kernel, same scales** | **0.237** |
 | Real FP8 kernel on pure random gaussian inputs | 0.111 @1k → 0.158 @10k tokens |
 
-The decomposition is unambiguous: input scales contribute ~0.06 of the 0.24 — **the FP8 kernel itself carries an 11–16% intrinsic relative error on diffuse attention, even on perfect gaussian inputs**. The culprit is precision in the P·V path: e4m3's 3 mantissa bits on the softmax matrix, at their worst exactly where video DiTs live — diffuse attention with probabilities ~1e-4 spread over ~10k tokens. LLM attention is sharp, which is why FP8 attention "works" there and why the failure went unnoticed: our own unit test used an absolute 5e-3 tolerance that silently admits ~12% relative error at diffuse-output magnitudes (since fixed to a relative bound).
+The decomposition is unambiguous: input scales contribute ~0.06 of the 0.24 — **the FP8 kernel itself carries an 11–16% intrinsic relative error on diffuse attention, even on exactly-fp8-representable inputs with descale=1**. Structural forensics then pinned the mechanism precisely. One-hot, graded two-hot, and uniform-attention probes are all *exact* — no packing, transfer, or accumulation defect. The error switches on with **logit dynamic range**: 0.027 at logit σ=0.25, 0.14 at σ=1, 0.36 at σ=2, while a true-fp8-math simulation stays flat at 0.02. The culprit: FA4's pipelined softmax computes P̃ against a *delayed* running max, so P̃ transiently exceeds 1 — and with `max_offset=8` (P̃×256), e4m3 saturates at 448, leaving only **1.75x headroom**. Wide-range logits clip P silently. Video DiTs live at σ≈1; LLM attention is sharp and never grows the max mid-sequence, which is why FP8 attention "works" there and why the failure went unnoticed — helped by test suites using absolute tolerances that silently admit ~12% relative error at diffuse-output magnitudes (ours since fixed to a relative bound).
+
+The fix is one constant — `max_offset` 8→4 (28x headroom, best value on real activations) — worth an upstream patch on its own: it takes stock full-FP8 from 0.237 to 0.069 on real activations, and to **0.044 with Hadamard inputs, at the unchanged 1.49x kernel speed**.
 
 Step scheduling (bf16 early steps) recovers some compounding — 0.733 → 0.840 at best — and an elaborate input-side stack (Hadamard + percentile scales + chunked per-block scales with LSE merging) cuts per-call error 30% yet **does not improve videos at all**. The ceiling was in the kernel; the fix had to be too.
 
