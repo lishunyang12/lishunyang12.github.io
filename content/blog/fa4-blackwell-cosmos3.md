@@ -182,7 +182,36 @@ Three observations:
 
 1. **i2v suffers visibly more than t2v** — reference-conditioned tasks accumulate error against a fixed image, so quantization noise has nowhere to hide.
 2. `fp8_start_step` recovers quality monotonically, and **the earliest steps carry the most weight** (start 5 already claws back nearly half the gap) — confirming the early-step-sensitivity hypothesis. The speed cost is linear and mild: at 189 frames FP8 saves ~0.55 s/step, so start 12/35 keeps roughly 2/3 of the speedup.
-3. The curve flattens (i2v: 5→12 gains +0.027, 12→18 only +0.009). The schedule can only reclaim the *compounding* of early-step error; residual late-step quantization noise is the floor. Going further needs finer-grained scales (per-block), which the FA4 kernel API currently rules out — it accepts only per-(batch, kv-head) descales.
+3. The curve flattens (i2v: 5→12 gains +0.027, 12→18 only +0.009). The schedule can only reclaim the *compounding* of early-step error; the residual is a floor — and the next section shows why no input-side technique moves it.
+
+## Where the FP8 error really lives — and the quality ceiling
+
+The obvious next move was finer-grained quantization (SageAttention-style blockwise scales). Before building it, we decomposed the error on **captured real Cosmos3 activations** (relative error vs the bf16 kernel, GQA 32/8, ~10k KV tokens):
+
+| Error source | rel. error |
+|---|---|
+| Input quantization alone (current per-head scales, quantize-dequantize through the bf16 kernel) | 0.050–0.067 |
+| Input quant at SageAttention-style 128-token blocks | 0.065 (no help) |
+| Input quant with Hadamard rotation (FA3-style incoherent processing) | 0.038 |
+| **Real FP8 kernel, same scales** | **0.237** |
+| Real FP8 kernel on pure random gaussian inputs | 0.111 @ 1k → 0.158 @ 10k tokens |
+| Best input-side stack (Hadamard + smooth-K + per-chunk K/V scales + LSE-merged chunked calls) | 0.166 |
+
+The decomposition overturns the granularity hypothesis: input scales contribute only ~0.06 of the 0.24, and **the FP8 kernel itself carries an ~11–16% intrinsic relative error on diffuse attention — even on perfect gaussian inputs**. The mechanism is e4m3's 3-bit mantissa on the softmax matrix P: video DiT attention is *diffuse* (probabilities ~1e-4 across ~10k tokens), the regime where FP8 P-rounding is weakest. LLM attention is sharp, which is why FP8 attention "works" there — the FA3-on-Hopper accumulation story, in a new costume.
+
+We then built the best input-side stack anyway and ran it end-to-end (videos below): it cuts per-call error 30% (0.237 → 0.166) yet **does not improve video quality** — i2v SSIM 0.839 vs 0.831 for plain FP8 at the same schedule, t2v actually drops (0.925 vs 0.940), and from step 0 it is markedly worse (0.588 vs 0.733). Mean per-call error is not what the diffusion trajectory cares about; the stack's error is more *structured* (chunk-coherent attention shifts, rotated-basis noise), and structured error compounds worse.
+
+**Conclusion: the practical quality ceiling for FA4 FP8 on DiT today is plain per-head quantization + `fp8_start_step` — the shipped configuration.** Going past it requires kernel-level changes: a higher-precision P path (fp16-P·V or INT8-QKᵀ, exactly SageAttention's design — whose sm_120 kernels do not run on datacenter sm_100). We are filing the gaussian-input repro upstream; a relative-tolerance fix to our own unit test is also in order, since an absolute 5e-3 bound at diffuse magnitudes silently admits ~12% relative kernel error.
+
+<figure>
+<div class="gal">
+<div><video src="/videos/fa4/i2v_cudnn.mp4" controls muted loop playsinline></video><div class="c">cuDNN (baseline)</div></div>
+<div><video src="/videos/fa4/i2v_fp8_start12.mp4" controls muted loop playsinline></video><div class="c">FP8 start 12 · SSIM 0.831</div></div>
+<div><video src="/videos/fa4/i2v_fp8_start18.mp4" controls muted loop playsinline></video><div class="c">FP8 start 18 · SSIM 0.840</div></div>
+<div><video src="/videos/fa4/i2v_fp8_best_start12.mp4" controls muted loop playsinline></video><div class="c">max-quality stack, start 12 · SSIM 0.839</div></div>
+</div>
+<figcaption>Fig. 3 — the quality ceiling, i2v. The elaborate input-side stack (rightmost) lands on top of plain FP8 with the same step schedule: the FP8 kernel's intrinsic diffuse-attention error is the binding constraint, not our quantization.</figcaption>
+</figure>
 
 ## User guide
 
