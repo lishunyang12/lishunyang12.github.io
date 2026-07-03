@@ -41,6 +41,31 @@ Same seed (42), official 35-step config, 1280x720, 33 frames. Within each row on
 <figcaption>Fig. 2 — i2v, dual robot-arm demo conditioned on the official reference image. Reference-conditioned tasks are the most FP8-sensitive.</figcaption>
 </figure>
 
+Every video above comes from one command template — only the backend selector changes between columns. Prompts, negative prompt, and the i2v reference image are the official Cosmos3 example assets (from [cosmos3-playground](https://github.com/lishunyang12/cosmos3-playground)); generation parameters are the paper defaults with only the frame count changed.
+
+```bash
+# Column 1 — cuDNN baseline (t2v; i2v adds --image i2v_robot.jpg and its own prompt)
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "$(cat prompt_t2v.json)" --negative-prompt "$(cat neg_prompts.json)" \
+  --height 720 --width 1280 --fps 24 \
+  --num-frames 33 --num-inference-steps 35 --guidance-scale 6.0 --seed 42 \
+  --output t2v_cudnn.mp4
+
+# Column 2 — FA4 bf16: identical flags, one env var
+DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN_4 python ...   # same flags as above
+```
+
+```python
+# Columns 3 and 4 — FA4 FP8: identical flags, attention config on Omni
+omni = Omni(model="nvidia/Cosmos3-Nano",
+            diffusion_attention_config={"default": {
+                "backend": "FLASH_ATTN_4",
+                "extra": {"fp8": True},                      # column 3: FP8 from step 0
+                # "extra": {"fp8": True, "fp8_start_step": 12},  # column 4
+            }})
+```
+
 ## Kernel level: bf16 is parity, FP8 is the whole point
 
 Dense non-causal attention, head_dim 128, median of 50 iterations, idle GPU. Speedups vs cuDNN.
