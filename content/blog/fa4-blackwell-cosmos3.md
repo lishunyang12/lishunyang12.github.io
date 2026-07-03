@@ -219,26 +219,26 @@ If the binding constraint is in-kernel, change the kernel. SageAttention's essen
 
 Two of the bugs en route are worth recording. Several P-path sites keyed on `q_dtype` where they meant "P's dtype" (the tmem store repetition, the register recast) — invisible until the two diverge. And the K/V shared-smem design byte-aliases V onto K's stages, which is unsound when their swizzle families differ: at head_dim ≥ 96, fp8-K and bf16-V pick different swizzle atoms and the load warp faults. Fix: in mixed mode V gets its own smem region after the K stages (budgeted K+V per stage instead of max).
 
-The result eliminates the FP8 kernel's intrinsic error entirely:
+Adding a Hadamard rotation on Q/K before quantization (exact for QKᵀ, no output correction needed since V is untouched, fused into the compiled quant block at negligible cost) then halves the remaining input-quantization error. The combined result:
 
-| Metric | full FP8 | **mixed** |
-|---|---|---|
-| rel. error, randn (1k–16k tokens, incl. GQA) | 0.07–0.16, grows with length | **0.038 flat** |
-| rel. error, real Cosmos3 activations | 0.237 | **0.065 (= input-quant floor)** |
-| kernel latency @16k H40 D128 vs cuDNN | 1.15x | 1.09x |
-| **e2e SSIM, i2v, step 0, no schedule** | 0.733 | **0.926** |
-| **e2e SSIM, t2v, step 0, no schedule** | 0.872 | **0.910** |
+| Metric | full FP8 | mixed | **mixed + Hadamard** |
+|---|---|---|---|
+| rel. error, real Cosmos3 activations | 0.237 | 0.065 | **0.032** |
+| kernel latency @21.5k–86k vs cuDNN | 1.49x | 1.24–1.25x | ~1.24x |
+| e2e @189f t2v vs cuDNN | 1.22–1.28x | ~1.08–1.12x | ~1.1x |
+| **e2e SSIM, i2v, step 0, no schedule** | 0.733 | 0.926 | **0.963** (floor 0.968) |
+| **e2e SSIM, t2v, step 0, no schedule** | 0.872 | 0.910 | **0.950** (floor 0.975) |
 
-i2v jumps from 0.84 (the best any schedule could reach) to 0.926 with no schedule at all — and `fp8_start_step` still composes on top for workloads that want to close in on the 0.97 bf16 floor. The speed trade is the expected one: only the QKᵀ half accelerates, so the mixed kernel keeps roughly 60% of full-FP8's kernel win (projected ~1.15–1.2x e2e at 189 frames vs FP8's 1.22–1.28x; clean long-sequence measurement in progress). Zero Dynamo recompiles in the compiled pipeline.
+i2v lands 0.005 below the bf16 same-seed floor — visually-indistinguishable territory, with no step schedule and no latency give-back beyond the P·V precision itself. Zero Dynamo recompiles in the compiled pipeline. The remaining roadmap inside the kernel: INT8 QKᵀ (s8×s8→s32 runs at the same 2x rate; ~7 effective mantissa bits vs e4m3's 3; the 32-bit accumulator keeps the tmem plumbing unchanged) to close the last gap, and Sage2-style fp8 P·V with per-block P scales to recover full-FP8's 1.49x kernel speed.
 
 <figure>
 <div class="gal">
 <div><video src="/videos/fa4/i2v_cudnn.mp4" controls muted loop playsinline></video><div class="c">cuDNN (baseline)</div></div>
 <div><video src="/videos/fa4/i2v_fa4_fp8.mp4" controls muted loop playsinline></video><div class="c">full FP8 · SSIM 0.733</div></div>
-<div><video src="/videos/fa4/i2v_fp8_start18.mp4" controls muted loop playsinline></video><div class="c">FP8 start 18 · SSIM 0.840</div></div>
 <div><video src="/videos/fa4/i2v_fa4_mixed.mp4" controls muted loop playsinline></video><div class="c">mixed kernel · SSIM 0.926</div></div>
+<div><video src="/videos/fa4/i2v_fa4_mixed_had.mp4" controls muted loop playsinline></video><div class="c">mixed + Hadamard · SSIM 0.963</div></div>
 </div>
-<figcaption>Fig. 4 — the mixed kernel breaks the ceiling on i2v: no step schedule, same seed, official config. t2v analog: 0.872 → 0.910 (video: <a href="/videos/fa4/t2v_fa4_mixed.mp4">t2v_fa4_mixed</a>).</figcaption>
+<figcaption>Fig. 4 — breaking the ceiling on i2v: no step schedule, same seed, official config. bf16 floor is 0.968. t2v analog: 0.872 → 0.910 → 0.950 (video: <a href="/videos/fa4/t2v_fa4_mixed_had.mp4">t2v_fa4_mixed_had</a>).</figcaption>
 </figure>
 
 Status: the kernel changes live on a flash-attention branch (upstreaming planned — they are a clean per-operand-dtype generalization); the vLLM-Omni backend knob will follow as a stacked PR once the kernel side is released.
