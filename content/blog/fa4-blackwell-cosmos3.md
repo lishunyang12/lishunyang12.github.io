@@ -213,6 +213,36 @@ We then built the best input-side stack anyway and ran it end-to-end (videos bel
 <figcaption>Fig. 3 — the quality ceiling, i2v. The elaborate input-side stack (rightmost) lands on top of plain FP8 with the same step schedule: the FP8 kernel's intrinsic diffuse-attention error is the binding constraint, not our quantization.</figcaption>
 </figure>
 
+## Breaking the ceiling: a mixed-precision kernel (fp8 QKᵀ + bf16 P·V)
+
+If the binding constraint is in-kernel, change the kernel. SageAttention's essential design — low-precision QKᵀ, high-precision P·V — turned out to be reachable *inside* FA4's own CuTe-DSL sm100 kernel, because the code is already dtype-parameterized per operand (the PV tiled-MMA and the P tmem layout key on `v_dtype`). We built the mixed mode on a branch of flash-attention: fp8 Q/K with per-head descales feed the QKᵀ MMA; P is converted to bf16 and the P·V MMA runs in bf16 against unquantized V. About 90 changed lines, all no-ops for existing same-dtype kernels.
+
+Two of the bugs en route are worth recording. Several P-path sites keyed on `q_dtype` where they meant "P's dtype" (the tmem store repetition, the register recast) — invisible until the two diverge. And the K/V shared-smem design byte-aliases V onto K's stages, which is unsound when their swizzle families differ: at head_dim ≥ 96, fp8-K and bf16-V pick different swizzle atoms and the load warp faults. Fix: in mixed mode V gets its own smem region after the K stages (budgeted K+V per stage instead of max).
+
+The result eliminates the FP8 kernel's intrinsic error entirely:
+
+| Metric | full FP8 | **mixed** |
+|---|---|---|
+| rel. error, randn (1k–16k tokens, incl. GQA) | 0.07–0.16, grows with length | **0.038 flat** |
+| rel. error, real Cosmos3 activations | 0.237 | **0.065 (= input-quant floor)** |
+| kernel latency @16k H40 D128 vs cuDNN | 1.15x | 1.09x |
+| **e2e SSIM, i2v, step 0, no schedule** | 0.733 | **0.926** |
+| **e2e SSIM, t2v, step 0, no schedule** | 0.872 | **0.910** |
+
+i2v jumps from 0.84 (the best any schedule could reach) to 0.926 with no schedule at all — and `fp8_start_step` still composes on top for workloads that want to close in on the 0.97 bf16 floor. The speed trade is the expected one: only the QKᵀ half accelerates, so the mixed kernel keeps roughly 60% of full-FP8's kernel win (projected ~1.15–1.2x e2e at 189 frames vs FP8's 1.22–1.28x; clean long-sequence measurement in progress). Zero Dynamo recompiles in the compiled pipeline.
+
+<figure>
+<div class="gal">
+<div><video src="/videos/fa4/i2v_cudnn.mp4" controls muted loop playsinline></video><div class="c">cuDNN (baseline)</div></div>
+<div><video src="/videos/fa4/i2v_fa4_fp8.mp4" controls muted loop playsinline></video><div class="c">full FP8 · SSIM 0.733</div></div>
+<div><video src="/videos/fa4/i2v_fp8_start18.mp4" controls muted loop playsinline></video><div class="c">FP8 start 18 · SSIM 0.840</div></div>
+<div><video src="/videos/fa4/i2v_fa4_mixed.mp4" controls muted loop playsinline></video><div class="c">mixed kernel · SSIM 0.926</div></div>
+</div>
+<figcaption>Fig. 4 — the mixed kernel breaks the ceiling on i2v: no step schedule, same seed, official config. t2v analog: 0.872 → 0.910 (video: <a href="/videos/fa4/t2v_fa4_mixed.mp4">t2v_fa4_mixed</a>).</figcaption>
+</figure>
+
+Status: the kernel changes live on a flash-attention branch (upstreaming planned — they are a clean per-operand-dtype generalization); the vLLM-Omni backend knob will follow as a stacked PR once the kernel side is released.
+
 ## User guide
 
 **Requirements**: datacenter Blackwell GPU (sm_100/sm_103), CUDA 13 torch build, and:
