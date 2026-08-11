@@ -93,6 +93,16 @@
     }
   }
 
+  .gal.gal-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+
+    .c {
+      font-size: 0.75em;
+      line-height: 1.45;
+    }
+  }
+
   .callout {
     background: #f6faef;
     border-left: 4px solid $accent;
@@ -107,4 +117,5 @@
 
 @media only screen and (max-width: 600px) {
   .post .gal { grid-template-columns: repeat(2, 1fr); }
+  .post .gal.gal-2 { grid-template-columns: 1fr; }
 }
