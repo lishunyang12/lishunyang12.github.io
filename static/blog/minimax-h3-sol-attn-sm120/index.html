@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniMax-H3 Sol-Attn on SM120</title>
-  <meta name="description" content="Full-width same-seed Dense cuDNN and Sol-Attn video comparisons for MiniMax-H3 on SM120.">
+  <meta name="description" content="Full-width same-seed Dense cuDNN, Sol-Attn preset, and full-exact video comparisons for MiniMax-H3 on SM120.">
   <link rel="icon" href="/images/icon.png">
   <style>
     :root {
@@ -77,7 +77,7 @@
 
     .summary {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
       margin: 26px 0 48px;
     }
@@ -99,6 +99,17 @@
       color: var(--muted);
       font-size: 0.88rem;
     }
+
+    .comparison-intro {
+      margin: 70px 0 26px;
+      padding: 28px 30px;
+      border: 1px solid var(--line);
+      border-left: 6px solid var(--accent);
+      border-radius: 14px;
+      background: var(--soft);
+    }
+
+    .comparison-intro .lead { margin-top: 12px; }
 
     .video-card {
       margin: 0 0 46px;
@@ -246,7 +257,7 @@
     <header>
       <p class="eyebrow">MiniMax-H3 · 4× NVIDIA SM120 · BF16</p>
       <h1>Sol-Attn speed–quality comparison</h1>
-      <p class="lead">Four full-width, same-seed T2VA outputs: exact Dense cuDNN plus the Recommended, Medium, and Aggressive Sol-Attn configurations. Every clip includes model-generated audio.</p>
+      <p class="lead">Six full-width, same-seed T2VA outputs: the original Dense cuDNN reference and three Sol-Attn presets, followed by a fresh Dense-versus-full-exact control. Every clip includes model-generated audio.</p>
       <a class="source" href="https://github.com/lishunyang12/vllm-omni-rankings/commit/bce933957ed957dab7f743ef81afbde29db27fe9">Source commit bce9339 →</a>
     </header>
 
@@ -254,6 +265,7 @@
       <div><strong>1.097×</strong><span>Recommended speedup</span></div>
       <div><strong>1.140×</strong><span>Medium speedup</span></div>
       <div><strong>1.205×</strong><span>Aggressive speedup</span></div>
+      <div><strong>4.25%</strong><span>Full-exact Sol overhead</span></div>
     </section>
 
     <article class="video-card">
@@ -328,10 +340,54 @@
       </div>
     </article>
 
+    <section class="comparison-intro">
+      <p class="eyebrow">Dense-limit control</p>
+      <h2>What does Sol-Attn cost with sparsity disabled?</h2>
+      <p class="lead">A full-sequence exact sink pins every KV block to Sol-Attn's exact path. This isolates Sol kernel overhead from sparse-routing speedup: 148.49 seconds versus 142.43 seconds for cuDNN, or 4.25% slower.</p>
+      <a class="source" href="https://github.com/lishunyang12/vllm-omni-rankings/commit/f5ed8d7">Exact-route source videos f5ed8d7 →</a>
+    </section>
+
+    <article class="video-card">
+      <div class="card-head">
+        <div>
+          <h2>Dense cuDNN · Exact-route control</h2>
+          <p class="config">backend=CUDNN_ATTN · fresh control run</p>
+        </div>
+        <span class="badge reference">REFERENCE</span>
+      </div>
+      <video src="/videos/sol-attn-sm120/exact-route-dense-cudnn.mp4" controls loop playsinline preload="metadata" aria-label="Dense cuDNN exact-route control video"></video>
+      <div class="metrics">
+        <div class="metric"><span>Latency</span><strong>142.43 s</strong></div>
+        <div class="metric"><span>Relative</span><strong>1.000×</strong></div>
+        <div class="metric"><span>SSIM</span><strong>1.00000</strong></div>
+        <div class="metric"><span>PSNR</span><strong>∞</strong></div>
+        <div class="metric"><span>LPIPS</span><strong>0.00000</strong></div>
+      </div>
+    </article>
+
+    <article class="video-card">
+      <div class="card-head">
+        <div>
+          <h2>Sol-Attn · Full exact route</h2>
+          <p class="config">tau=0.0 · dense_steps=0 · dense_layers="" · sink_tokens=full sequence · kv_splits=1</p>
+        </div>
+        <span class="badge">PASS · 4.25% SLOWER</span>
+      </div>
+      <video src="/videos/sol-attn-sm120/sol-exact-route.mp4" controls loop playsinline preload="metadata" aria-label="Sol-Attn full exact-route video"></video>
+      <div class="metrics">
+        <div class="metric"><span>Latency</span><strong>148.49 s</strong></div>
+        <div class="metric"><span>Relative</span><strong>0.959×</strong></div>
+        <div class="metric"><span>SSIM</span><strong>0.95447</strong></div>
+        <div class="metric"><span>PSNR</span><strong>36.17 dB</strong></div>
+        <div class="metric"><span>LPIPS</span><strong>0.05081</strong></div>
+      </div>
+    </article>
+
     <section class="notes">
       <h2>Test prompt</h2>
       <blockquote>At night, while their owner sleeps, three cats march into a bedroom playing tiny brass instruments, freeze, and quietly march out.</blockquote>
       <p>Seed 1101 · 1344×768 · 24 fps · 20 inference steps · three measured timing runs after one warmup. Quality metrics use Run 1 against the Dense reference. Gates: SSIM ≥ 0.82, PSNR ≥ 20 dB, LPIPS ≤ 0.20.</p>
+      <p>The dense-limit control uses its own freshly generated cuDNN reference. Full exact routing keeps every KV block exact but is not numerically identical to cuDNN because the kernels use different blockwise softmax and accumulation orders.</p>
       <p>This is a single-prompt calibration snapshot, not a broad video-generation benchmark.</p>
     </section>
   </main>
